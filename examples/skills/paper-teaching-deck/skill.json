@@ -1,0 +1,38 @@
+{
+  "name": "paper-teaching-deck",
+  "description": "Generate a graduate-level teaching deck from an academic paper.",
+  "when_to_use": "Use when the user wants to explain a paper to students or researchers.",
+  "type": "markdown",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "source_pdfs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "audience": {
+        "type": "string"
+      },
+      "min_slides": {
+        "type": "integer"
+      },
+      "topic": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_pdfs"
+    ]
+  },
+  "allowed_builtin_skills": [
+    "scan_workspace",
+    "generate_plan",
+    "show_current_plan",
+    "revise_plan",
+    "build_ppt"
+  ],
+  "requires_approval": false,
+  "is_read_only": true
+}

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "request": {
+    "topic": "AI 销售赋能方案",
+    "audience": "general business audience",
+    "tone": "clear and pragmatic",
+    "output_path": "deck.pptx"
+  },
+  "title": "AI 销售赋能方案",
+  "theme": null,
+  "outline": [
+    "AI 销售赋能方案",
+    "Key Message",
+    "Execution Plan",
+    "Next Steps"
+  ],
+  "slides": [
+    {
+      "title": "AI 销售赋能方案",
+      "bullets": [
+        "Context and objective",
+        "Audience needs",
+        "Definition of success"
+      ],
+      "speaker_notes": "Open by framing why AI 销售赋能方案 matters to general business audience."
+    },
+    {
+      "title": "Key Message",
+      "bullets": [
+        "Primary recommendation",
+        "Supporting evidence",
+        "Tradeoffs and constraints"
+      ],
+      "speaker_notes": ""
+    },
+    {
+      "title": "Execution Plan",
+      "bullets": [
+        "Near-term actions",
+        "Owners and milestones",
+        "Risks to monitor"
+      ],
+      "speaker_notes": ""
+    },
+    {
+      "title": "Next Steps",
+      "bullets": [
+        "Decision needed",
+        "Follow-up work",
+        "Success metrics"
+      ],
+      "speaker_notes": ""
+    }
+  ],
+  "mode": "plan",
+  "approved": false,
+  "transitions": [
+    "plan"
+  ]
+}

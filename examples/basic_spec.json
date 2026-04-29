@@ -1,0 +1,33 @@
+{
+  "title": "Quarterly Product Roadmap",
+  "audience": "product and engineering leadership",
+  "slides": [
+    {
+      "title": "Roadmap Context",
+      "bullets": [
+        "Business objectives",
+        "Customer signals",
+        "Delivery constraints"
+      ],
+      "speaker_notes": "Frame the quarter around outcomes and tradeoffs."
+    },
+    {
+      "title": "Priorities",
+      "bullets": [
+        "Improve activation",
+        "Reduce operational toil",
+        "Prepare enterprise launch"
+      ],
+      "speaker_notes": ""
+    },
+    {
+      "title": "Next Steps",
+      "bullets": [
+        "Confirm scope",
+        "Assign owners",
+        "Track weekly risks"
+      ],
+      "speaker_notes": ""
+    }
+  ]
+}
