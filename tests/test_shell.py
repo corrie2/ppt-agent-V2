@@ -2,7 +2,14 @@ from pathlib import Path
 
 from ppt_agent.agent.chat_agent import ChatAgent, RouterDecision, SkillCall
 from ppt_agent.agent.skill_registry import EmptySkillInput, SkillDefinition, SkillRegistry, SkillResult
-from ppt_agent.agent.skills import BuildPptInput, GeneratePlanInput, build_ppt_skill, generate_plan_skill, register_default_skills
+from ppt_agent.agent.skills import (
+    BuildHtmlDeckInput,
+    BuildPptInput,
+    GeneratePlanInput,
+    build_ppt_skill,
+    generate_plan_skill,
+    register_default_skills,
+)
 from ppt_agent.agent.user_skills import reload_user_skills
 from ppt_agent.nodes.qa import qa_node
 from ppt_agent.runtime.html_deck import validate_html_deck
@@ -78,6 +85,14 @@ class _ScanOnlyAgent:
         return RouterDecision(
             reply="I will scan first.",
             skill_calls=[SkillCall(name="scan_workspace", arguments={"max_depth": 3})],
+        )
+
+
+class _BuildHtmlAgent:
+    def respond(self, session: ShellSession, message: str, registry: SkillRegistry | None = None) -> RouterDecision:
+        return RouterDecision(
+            reply="I will build the HTML deck.",
+            skill_calls=[SkillCall(name="build_html_deck", arguments={"plan_path": "plan.json"})],
         )
 
 
@@ -1922,6 +1937,40 @@ def test_default_skill_registry_keeps_names_and_flags(tmp_path):
     assert registry.get("retrieve_failure_patterns").is_read_only is True
     assert registry.get("validate_plan").is_read_only is True
     assert registry.get("show_current_plan").is_read_only is True
+
+
+def test_chat_agent_cannot_bypass_html_build_approval(tmp_path):
+    outputs: list[str] = []
+    session = ShellSession.create(tmp_path)
+    registry = SkillRegistry()
+
+    def forbidden_build(**kwargs):
+        raise AssertionError("build_html_deck should be queued for approval, not invoked directly")
+
+    registry.register(
+        SkillDefinition(
+            name="build_html_deck",
+            description="Build HTML deck.",
+            input_schema=BuildHtmlDeckInput,
+            callable=forbidden_build,
+            requires_approval=True,
+        )
+    )
+    inputs = iter(["1", "build html", "/exit"])
+
+    run_shell(
+        input_fn=lambda prompt: next(inputs),
+        output_fn=outputs.append,
+        session=session,
+        agent=_BuildHtmlAgent(),
+        registry=registry,
+    )
+
+    assert session.pending_action is not None
+    assert session.pending_action.skill_name == "build_html_deck"
+    assert session.pending_action.arguments == {"plan_path": "plan.json"}
+    assert session.last_build_status == "pending_approval"
+    assert "build_html_deck is pending approval. Run /approve to continue." in outputs
 
 
 def test_shell_startup_reprompts_after_invalid_assistant_mode_choice(tmp_path):

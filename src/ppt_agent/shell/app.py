@@ -212,15 +212,21 @@ def _explicit_disabled_user_skill(text: str, session: ShellSession) -> str | Non
 
 
 def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registry: SkillRegistry, output_fn) -> None:
-    if skill_call.name == "build_ppt":
-        arguments = registry.validate_arguments(skill_call.name, skill_call.arguments or {"plan_path": session.latest_plan_path})
+    if registry.get(skill_call.name).requires_approval:
+        arguments = dict(skill_call.arguments or {})
+        if skill_call.name == "build_ppt" and not arguments.get("plan_path"):
+            arguments["plan_path"] = session.latest_plan_path
+        arguments = registry.validate_arguments(skill_call.name, arguments)
         session.pending_action = PendingAction(
-            skill_name="build_ppt",
+            skill_name=skill_call.name,
             arguments=arguments,
-            description="build PPT from the current plan",
+            description=_pending_skill_description(skill_call.name),
         )
         session.last_build_status = "pending_approval"
-        output_fn("Build is pending approval. Run /approve to continue.")
+        if skill_call.name == "build_ppt":
+            output_fn("Build is pending approval. Run /approve to continue.")
+        else:
+            output_fn(f"{skill_call.name} is pending approval. Run /approve to continue.")
         return
 
     if skill_call.name == "generate_plan":
@@ -260,6 +266,15 @@ def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registr
     if skill_call.name == "generate_plan":
         _qa_generated_plan(result, session=session, registry=registry, output_fn=output_fn)
         _set_pending_build_from_plan_result(result, session=session, output_fn=output_fn)
+
+
+def _pending_skill_description(skill_name: str) -> str:
+    descriptions = {
+        "build_ppt": "build PPT from the current plan",
+        "build_html_deck": "build HTML deck from the current plan",
+        "run_from_plan": "run from an existing plan",
+    }
+    return descriptions.get(skill_name, f"run {skill_name}")
 
 
 def _handle_draft_request(text: str, *, session: ShellSession, registry: SkillRegistry, output_fn) -> bool:

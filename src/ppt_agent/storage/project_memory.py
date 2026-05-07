@@ -31,18 +31,44 @@ def ensure_project_memory(workspace: Path) -> Path:
 
 def retrieve_project_memory(workspace: Path, *, query: str = "", limit: int = 20) -> dict[str, Any]:
     ensure_project_memory(workspace)
+    long_term_preferences = _maybe_read_long_term_memory(
+        workspace,
+        memory_types=["user_preference"],
+        query=query,
+        limit=limit,
+    )
+    long_term_accepted_outputs = _maybe_read_long_term_memory(
+        workspace,
+        memory_types=["accepted_output"],
+        query=query,
+        limit=limit,
+    )
     preferences = _load_preferences(workspace)
     accepted_outputs = _read_jsonl(project_memory_dir(workspace) / ACCEPTED_OUTPUTS_FILE)
     return {
-        "preferences": _rank_records(preferences.get("preferences", []), query=query, limit=limit),
-        "accepted_outputs": _rank_records(accepted_outputs, query=query, limit=limit),
+        "preferences": long_term_preferences
+        if long_term_preferences is not None
+        else _rank_records(preferences.get("preferences", []), query=query, limit=limit),
+        "accepted_outputs": long_term_accepted_outputs
+        if long_term_accepted_outputs is not None
+        else _rank_records(accepted_outputs, query=query, limit=limit),
     }
 
 
 def retrieve_failure_patterns(workspace: Path, *, query: str = "", limit: int = 20) -> dict[str, Any]:
     ensure_project_memory(workspace)
+    long_term_failures = _maybe_read_long_term_memory(
+        workspace,
+        memory_types=["qa_failure"],
+        query=query,
+        limit=limit,
+    )
     failures = _read_jsonl(project_memory_dir(workspace) / QA_FAILURES_FILE)
-    return {"failure_patterns": _rank_records(failures, query=query, limit=limit)}
+    return {
+        "failure_patterns": long_term_failures
+        if long_term_failures is not None
+        else _rank_records(failures, query=query, limit=limit)
+    }
 
 
 def record_project_memory(
@@ -76,7 +102,19 @@ def record_project_memory(
         records.append(preference)
         stored = preference
     _write_json(path, data)
-    return {"preference": stored, "path": str(path)}
+    result = {"preference": stored, "path": str(path)}
+    long_term_result = _maybe_write_long_term_memory(
+        workspace,
+        memory_type="user_preference",
+        title=f"{inferred} preference",
+        content=feedback.strip(),
+        source_type=source,
+        source_ref=preference["id"],
+        tags=["project_memory", "preference", inferred],
+    )
+    if long_term_result is not None:
+        result["long_term_memory"] = long_term_result
+    return result
 
 
 def record_execution_trace(
@@ -91,11 +129,21 @@ def record_execution_trace(
         "qa_failure": QA_FAILURES_FILE,
         "accepted_output": ACCEPTED_OUTPUTS_FILE,
     }.get(trace_type, EXECUTION_TRACES_FILE)
-    path = _append_jsonl(
-        project_memory_dir(workspace) / file_name,
-        {"created_at": _now(), "type": trace_type, "event": event, "payload": payload or {}},
+    record = {"created_at": _now(), "type": trace_type, "event": event, "payload": payload or {}}
+    path = _append_jsonl(project_memory_dir(workspace) / file_name, record)
+    result = {"path": str(path)}
+    long_term_result = _maybe_write_long_term_memory(
+        workspace,
+        memory_type=trace_type,
+        title=event,
+        content=json.dumps(record, ensure_ascii=False, sort_keys=True),
+        source_type="project_memory",
+        source_ref=file_name,
+        tags=["project_memory", trace_type],
     )
-    return {"path": str(path)}
+    if long_term_result is not None:
+        result["long_term_memory"] = long_term_result
+    return result
 
 
 def infer_preference_category(text: str) -> str:
@@ -204,6 +252,170 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> Path:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _maybe_write_long_term_memory(
+    workspace: Path,
+    *,
+    memory_type: str,
+    title: str,
+    content: str,
+    source_type: str,
+    source_ref: str,
+    tags: list[str],
+) -> dict[str, Any] | None:
+    try:
+        from ppt_agent.storage.memory_config import load_memory_config
+
+        config = load_memory_config()
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+
+    if not config.enabled:
+        return None
+    if not config.database_url:
+        return {"status": "skipped", "reason": "PPT_AGENT_MEMORY_DATABASE_URL is not set"}
+    if _contains_sensitive_memory_data(content):
+        return {"status": "skipped", "reason": "sensitive memory content is not written to PostgreSQL"}
+
+    try:
+        from ppt_agent.storage.memory_db import CreateMemoryRecordInput
+        from ppt_agent.storage.semantic_memory import write_semantic_memory
+
+        result = write_semantic_memory(
+            workspace,
+            CreateMemoryRecordInput(
+                memory_type=memory_type,
+                title=title,
+                content=content,
+                source_type=source_type,
+                source_ref=source_ref,
+                tags=tags,
+            ),
+            config=config,
+        )
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+
+    return {
+        "status": "written",
+        "project_id": result.project.id,
+        "record_id": result.record.id,
+        "embedding_id": result.embedding.id if result.embedding else None,
+    }
+
+
+def _maybe_read_long_term_memory(
+    workspace: Path,
+    *,
+    memory_types: list[str],
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]] | None:
+    try:
+        from ppt_agent.storage.memory_config import load_memory_config
+
+        config = load_memory_config()
+    except Exception:
+        return None
+
+    if not config.enabled or not config.database_url:
+        return None
+
+    try:
+        if query.strip():
+            from ppt_agent.storage.semantic_memory import search_semantic_memory
+
+            results = search_semantic_memory(
+                workspace,
+                query,
+                config=config,
+                memory_types=memory_types,
+                limit=limit,
+            )
+            return [_long_term_search_result_to_project_memory(item) for item in results]
+
+        from ppt_agent.storage.memory_db import ensure_memory_project, list_memory_records
+        from ppt_agent.storage.memory_scope import resolve_project_scope
+
+        project = ensure_memory_project(resolve_project_scope(workspace), config=config)
+        records = list_memory_records(project, memory_types=memory_types, limit=limit, config=config)
+        return [_long_term_record_to_project_memory(record) for record in records]
+    except Exception:
+        return None
+
+
+def _long_term_search_result_to_project_memory(result) -> dict[str, Any]:
+    item = _long_term_record_to_project_memory(result.record)
+    item["similarity"] = result.similarity
+    item["embedding_model"] = result.embedding_model
+    return item
+
+
+def _long_term_record_to_project_memory(record) -> dict[str, Any]:
+    base = {
+        "id": record.id,
+        "source": record.source_type,
+        "source_ref": record.source_ref,
+        "memory_type": record.memory_type,
+        "title": record.title,
+        "content": record.content,
+        "module_path": record.module_path,
+        "tags": record.tags,
+        "importance": record.importance,
+        "confidence": record.confidence,
+    }
+    if record.memory_type == "user_preference":
+        return {
+            **base,
+            "category": _category_from_tags(record.tags),
+            "preference": record.content,
+        }
+    try:
+        payload = json.loads(record.content)
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict):
+        return {**base, **payload}
+    return base
+
+
+def _category_from_tags(tags: list[str]) -> str:
+    for tag in tags:
+        if tag not in {"project_memory", "preference"}:
+            return tag
+    return "general"
+
+
+_SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|auth(orization)?|bearer|password|passwd|secret|private[_-]?key|session[_-]?cookie|cookie)",
+    re.IGNORECASE,
+)
+_SENSITIVE_TEXT_RE = re.compile(
+    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization\s*:|bearer\s+[A-Za-z0-9._~+/=-]+|password\s*[:=]|private\s+key|session[_-]?cookie|cookie\s*:)",
+    re.IGNORECASE,
+)
+
+
+def _contains_sensitive_memory_data(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _SENSITIVE_KEY_RE.search(str(key)):
+                return True
+            if _contains_sensitive_memory_data(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_contains_sensitive_memory_data(item) for item in value)
+    if isinstance(value, str):
+        if _SENSITIVE_TEXT_RE.search(value):
+            return True
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+        return _contains_sensitive_memory_data(parsed)
+    return False
 
 
 def _record_id(text: str) -> str:

@@ -1,0 +1,21 @@
+services:
+  memory-db:
+    image: pgvector/pgvector:pg16
+    container_name: ppt-agent-memory-db
+    environment:
+      POSTGRES_DB: ppt_agent_memory
+      POSTGRES_USER: ppt_agent
+      POSTGRES_PASSWORD: ppt_agent
+    ports:
+      - "54329:5432"
+    volumes:
+      - ppt_agent_memory_pgdata:/var/lib/postgresql/data
+      - ./db/schema:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ppt_agent_memory_pgdata:

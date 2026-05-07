@@ -17,6 +17,12 @@ dependencies = [
 dev = [
     "pytest>=8.2.0",
 ]
+memory = [
+    "psycopg[binary]>=3.2.0",
+]
+long-term-memory = [
+    "agent-long-memory @ git+https://github.com/corrie2/Tools.git#subdirectory=agent-long-memory",
+]
 
 [project.scripts]
 ppt-agent = "ppt_agent.cli.main:app"
@@ -28,3 +34,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ppt_agent"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

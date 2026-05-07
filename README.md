@@ -41,3 +41,10 @@ ppt-agent plan "Quarterly product roadmap" --provider deepseek --model deepseek-
 ## Current Scope
 
 The planner can use a configured LLM provider or fall back to the deterministic planner when no provider/model is configured. Artifact generation, validation, migration, build, and runtime writes remain deterministic and controlled by code.
+
+## Memory Policy
+
+Project memory stores durable project preferences, accepted outputs, and failure patterns. See [docs/memory-policy.md](docs/memory-policy.md) for what may be remembered, what must not be remembered, and how workspace-scoped long-term memory is isolated and governed.
+
+The reusable PostgreSQL/pgvector long-term memory library is installed from GitHub as `agent-long-memory` and imported as `agent_long_memory`. Install PPT Agent with the `long-term-memory` extra to pull it from `https://github.com/corrie2/Tools`; records are isolated by resolved workspace scope before any vector search is run.
+
