@@ -1,0 +1,31 @@
+[
+  {
+    "type": "title",
+    "text": "Sample Paper",
+    "page": 1
+  },
+  {
+    "type": "text",
+    "text": "Document decks need traceable claims so reviewers can audit every slide.",
+    "heading": "Problem and Motivation",
+    "page": 1
+  },
+  {
+    "type": "text",
+    "text": "The pipeline ingests parsed document evidence, creates a grounded plan, builds a PPTX deck, runs deterministic QA, and repairs the plan.",
+    "heading": "Method",
+    "page": 2
+  },
+  {
+    "type": "image",
+    "caption": "Document-to-deck pipeline fixture image.",
+    "path": "sample_image.png",
+    "page": 2
+  },
+  {
+    "type": "text",
+    "text": "The sample figure demonstrates the document-to-deck flow used by the end-to-end fixture.",
+    "heading": "Main Results",
+    "page": 3
+  }
+]

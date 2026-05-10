@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from enum import Enum
+from importlib import metadata
 from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
@@ -11,11 +13,16 @@ import httpx
 import typer
 from rich.console import Console
 
+from ppt_agent.domain.evidence import EvidencePack
 from ppt_agent.domain.models import AgentMode, AgentState, DeckIntent, PptSpec
 from ppt_agent.agent.skill_loader import load_user_skill, load_user_skills, project_skill_dir
 from ppt_agent.graph.agent import create_agent_graph
+from ppt_agent.ingest import EvidenceBuilder, MarkdownParser, MinerUAdapter
+from ppt_agent.ingest.mineru_adapter import MinerUOptions
 from ppt_agent.llm.planner import PlannerConfigError
 from ppt_agent.llm.providers import PROVIDER_SPECS, validate_model, validate_provider
+from ppt_agent.runtime.document_qa import DocumentQaReport, run_document_qa, write_document_qa_report
+from ppt_agent.runtime.document_repair import repair_plan_spec
 from ppt_agent.runtime.planner import test_planner_connection
 from ppt_agent.runtime.pptx import build_pptx
 from ppt_agent.storage.llm_settings import key_statuses, load_selection, save_api_key, save_selection
@@ -40,22 +47,63 @@ app.add_typer(llm_app, name="llm")
 app.add_typer(skill_app, name="skill")
 
 
+class IngestParser(str, Enum):
+    AUTO = "auto"
+    MARKDOWN = "markdown"
+    MINERU = "mineru"
+
+
+class MinerUBackend(str, Enum):
+    PIPELINE = "pipeline"
+    VLM_HTTP_CLIENT = "vlm-http-client"
+    HYBRID_HTTP_CLIENT = "hybrid-http-client"
+    VLM_AUTO_ENGINE = "vlm-auto-engine"
+    HYBRID_AUTO_ENGINE = "hybrid-auto-engine"
+
+
+class MinerUMethod(str, Enum):
+    AUTO = "auto"
+    TXT = "txt"
+    OCR = "ocr"
+
+
 @app.command()
 def plan(
-    topic: Annotated[str, typer.Argument(help="Presentation topic or goal.")],
+    topic: Annotated[str | None, typer.Argument(help="Presentation topic or goal. Optional when using --evidence.")] = None,
     spec: Annotated[Path, typer.Option("--spec", "-s", help="Where to write the structured spec.")] = Path("deck_spec.json"),
+    evidence: Annotated[Path | None, typer.Option("--evidence", help="EvidencePack JSON to ground the generated plan.")] = None,
     provider: Annotated[str | None, typer.Option("--provider", help="LLM provider override for planning.")] = None,
     model: Annotated[str | None, typer.Option("--model", help="LLM model override for planning.")] = None,
 ) -> None:
     """Create a structured deck spec without building a PPTX."""
     _validate_llm_override(provider=provider, model=model)
+    evidence_pack: EvidencePack | None = None
+    if evidence is not None:
+        try:
+            evidence_pack = _read_evidence_pack(evidence)
+        except ValueError as exc:
+            err_console.print(f"[bold red]plan[/bold red]: {exc}")
+            raise typer.Exit(code=1) from exc
+
+    effective_topic = topic or _topic_from_evidence(evidence_pack)
+    if not effective_topic:
+        err_console.print("[bold red]plan[/bold red]: topic is required unless --evidence is provided")
+        raise typer.Exit(code=2)
+
     graph = create_agent_graph()
-    memory = retrieve_project_memory(Path.cwd(), query=topic)
-    failures = retrieve_failure_patterns(Path.cwd(), query=topic)
+    if evidence_pack is None:
+        memory = retrieve_project_memory(Path.cwd(), query=effective_topic)
+        failures = retrieve_failure_patterns(Path.cwd(), query=effective_topic)
+    else:
+        memory = {"preferences": []}
+        failures = {"failure_patterns": []}
+    evidence_digest = _evidence_digest(evidence_pack, evidence_path=evidence) if evidence_pack is not None else None
     intent = DeckIntent(
-        topic=topic,
+        topic=effective_topic,
         project_preferences=memory.get("preferences", []),
         failure_patterns=failures.get("failure_patterns", []),
+        source_digest=evidence_digest,
+        source_context=(evidence_digest or {}).get("evidence_items", []) if evidence_digest else [],
     )
     state = AgentState(intent=intent, mode=AgentMode.PLAN, planner_provider=provider, planner_model=model)
     result = _invoke_graph_or_exit(graph, state)
@@ -81,12 +129,76 @@ def build(
         ),
     ],
     out: Annotated[Path, typer.Option("--out", "-o", help="Output PPTX path.")] = Path("deck.pptx"),
+    evidence: Annotated[Path | None, typer.Option("--evidence", help="EvidencePack JSON used to resolve figure_ids.")] = None,
 ) -> None:
     """Build a PPTX from a unified plan/spec JSON file with schema_version."""
     document = _load_executable_plan(spec, command_name="build")
     ppt_spec = document.spec
-    result = build_pptx(ppt_spec, out)
+    evidence_pack = None
+    if evidence is not None:
+        try:
+            evidence_pack = _read_evidence_pack(evidence)
+        except ValueError as exc:
+            err_console.print(f"[bold red]build[/bold red]: {exc}")
+            raise typer.Exit(code=1) from exc
+    result = build_pptx(ppt_spec, out, evidence_pack=evidence_pack, evidence_path=evidence)
     console.print(f"Wrote PPTX to [bold]{result.path}[/bold]")
+
+
+@app.command()
+def ingest(
+    input_path: Annotated[Path, typer.Argument(help="Markdown file or PDF to convert into evidence.json.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Where to write evidence.json.")],
+    parser: Annotated[IngestParser, typer.Option("--parser", help="Parser to use.")] = IngestParser.AUTO,
+    workdir: Annotated[Path, typer.Option("--workdir", help="MinerU working/output directory.")] = Path(".ppt-agent/ingest"),
+    mineru_backend: Annotated[
+        MinerUBackend | None,
+        typer.Option("--mineru-backend", help="MinerU backend to use for PDF parsing."),
+    ] = MinerUBackend.PIPELINE,
+    mineru_method: Annotated[
+        MinerUMethod | None,
+        typer.Option("--mineru-method", help="MinerU PDF parsing method."),
+    ] = MinerUMethod.AUTO,
+    mineru_lang: Annotated[str | None, typer.Option("--mineru-lang", help="Input language hint for MinerU OCR.")] = None,
+    mineru_start: Annotated[int | None, typer.Option("--mineru-start", help="Starting page for MinerU, zero-based.")] = None,
+    mineru_end: Annotated[int | None, typer.Option("--mineru-end", help="Ending page for MinerU, zero-based.")] = None,
+) -> None:
+    """Convert Markdown or MinerU output into an EvidencePack JSON file."""
+    try:
+        options = MinerUOptions(
+            backend=mineru_backend.value if mineru_backend is not None else None,
+            method=mineru_method.value if mineru_method is not None else None,
+            lang=mineru_lang,
+            start=mineru_start,
+            end=mineru_end,
+        )
+        pack = _build_ingest_evidence(input_path=input_path, parser=parser, workdir=workdir, mineru_options=options)
+    except (RuntimeError, ValueError, OSError) as exc:
+        err_console.print(f"[bold red]ingest[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(pack.to_json(), encoding="utf-8")
+    typer.echo(f"Sections: {len(pack.sections)}")
+    typer.echo(f"Figures: {len(pack.figures)}")
+    typer.echo(f"Tables: {len(pack.tables)}")
+    typer.echo(f"Output: {out}")
+
+
+@app.command()
+def doctor() -> None:
+    """Check optional local runtime dependencies."""
+    status = _mineru_status()
+    console.print("MinerU:")
+    console.print(f"  command: {'found' if status['command_found'] else 'missing'}")
+    if status["path"]:
+        console.print(f"  path: {status['path']}")
+    if status["package_version"]:
+        console.print(f"  package: {status['package_version']}")
+    if status["cli_version"]:
+        console.print(f"  cli: {status['cli_version']}")
+    if status["error"]:
+        console.print(f"  error: {status['error']}")
 
 
 @app.command()
@@ -107,6 +219,59 @@ def validate(
 
     if not report.ok:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def qa(
+    plan: Annotated[Path, typer.Argument(help="Path to a plan/spec JSON file.")],
+    evidence: Annotated[Path | None, typer.Option("--evidence", help="Optional EvidencePack JSON for citation and asset checks.")] = None,
+    out: Annotated[Path, typer.Option("--out", "-o", help="Where to write qa_report.json.")] = Path("qa_report.json"),
+) -> None:
+    """Run deterministic Document-to-Deck QA checks."""
+    try:
+        document = read_plan_document(plan)
+        evidence_pack = _read_evidence_pack(evidence) if evidence is not None else None
+    except ValueError as exc:
+        err_console.print(f"[bold red]qa[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    report = run_document_qa(document.spec, evidence_pack=evidence_pack, evidence_path=evidence)
+    write_document_qa_report(report, out)
+    console.print(f"QA Issues: {len(report.issues)}")
+    console.print(f"Output: {out}")
+    if not report.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def repair(
+    plan: Annotated[Path, typer.Argument(help="Path to the plan/spec JSON file to repair.")],
+    qa: Annotated[Path, typer.Option("--qa", help="qa_report.json produced by `ppt-agent qa`.")],
+    evidence: Annotated[Path | None, typer.Option("--evidence", help="Optional EvidencePack JSON for deterministic repair.")] = None,
+    out: Annotated[Path, typer.Option("--out", "-o", help="Where to write the repaired plan JSON.")] = Path("repaired_plan.json"),
+) -> None:
+    """Repair a plan/spec JSON using deterministic Document-to-Deck QA results."""
+    try:
+        document = read_plan_document(plan)
+        qa_report = DocumentQaReport.model_validate(_read_json_file(qa, label="qa report"))
+        evidence_pack = _read_evidence_pack(evidence) if evidence is not None else None
+    except ValueError as exc:
+        err_console.print(f"[bold red]repair[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    repaired = repair_plan_spec(document.spec, qa_report=qa_report, evidence_pack=evidence_pack)
+    write_plan_document(
+        out,
+        intent=_intent_from_plan_payload(document.payload, repaired),
+        spec=repaired,
+        mode=document.payload.get("mode", "plan"),
+        approved=document.payload.get("approved", False),
+        transitions=document.payload.get("transitions", []),
+        theme=document.payload.get("theme"),
+    )
+    issue_count = len(qa_report.issues)
+    console.print(f"Read QA Issues: {issue_count}")
+    console.print(f"Output: {out}")
 
 
 @app.command("migrate-plan")
@@ -252,6 +417,191 @@ def _write_run_plan(path: Path, state: dict) -> None:
 
 def _write_plan(path: Path, state: dict) -> None:
     _write_run_plan(path, state)
+
+
+def _read_json_file(path: Path, *, label: str) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"failed to read {label} {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in {label} {path}: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid {label} {path}: expected JSON object")
+    return payload
+
+
+def _intent_from_plan_payload(payload: dict, spec: PptSpec) -> DeckIntent:
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    return DeckIntent(
+        topic=request.get("topic", spec.title),
+        audience=request.get("audience", spec.audience),
+        tone=request.get("tone", "clear and pragmatic"),
+        output_path=request.get("output_path", "deck.pptx"),
+        source_digest=spec.source_digest,
+        applied_skills=spec.applied_skills,
+        output_format=spec.output_format,
+    )
+
+
+def _read_evidence_pack(path: Path) -> EvidencePack:
+    try:
+        return EvidencePack.from_json(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"failed to read evidence file {path}: {exc}") from exc
+    except ValueError as exc:
+        raise ValueError(f"invalid evidence file {path}: {exc}") from exc
+
+
+def _topic_from_evidence(pack: EvidencePack | None) -> str | None:
+    if pack is None:
+        return None
+    for source in pack.source_files:
+        if source.title:
+            return source.title
+        if source.source_file:
+            return Path(source.source_file).stem
+    return None
+
+
+def _evidence_digest(pack: EvidencePack, *, evidence_path: Path | None) -> dict:
+    return {
+        "type": "evidence_pack",
+        "path": str(evidence_path) if evidence_path else None,
+        "sources": [
+            {
+                "source_id": source.id,
+                "name": source.source_file,
+                "title": source.title or Path(source.source_file).stem,
+                "path": source.path,
+            }
+            for source in pack.source_files
+        ],
+        "evidence_items": [
+            *_section_summaries(pack),
+            *_figure_summaries(pack),
+            *_table_summaries(pack),
+            *_claim_summaries(pack),
+        ],
+    }
+
+
+def _section_summaries(pack: EvidencePack) -> list[dict]:
+    return [
+        {
+            "type": "section",
+            "evidence_id": section.id,
+            "source_file": section.source_file,
+            "page": section.page,
+            "heading": section.heading,
+            "text": _truncate(section.text),
+        }
+        for section in pack.sections[:24]
+    ]
+
+
+def _figure_summaries(pack: EvidencePack) -> list[dict]:
+    return [
+        {
+            "type": "figure",
+            "evidence_id": figure.id,
+            "source_file": figure.source_file,
+            "page": figure.page,
+            "caption": figure.caption,
+            "text": _truncate(figure.text or ""),
+            "path": figure.path,
+        }
+        for figure in pack.figures[:12]
+    ]
+
+
+def _table_summaries(pack: EvidencePack) -> list[dict]:
+    return [
+        {
+            "type": "table",
+            "evidence_id": table.id,
+            "source_file": table.source_file,
+            "page": table.page,
+            "caption": table.caption,
+            "text": _truncate(table.text or ""),
+        }
+        for table in pack.tables[:12]
+    ]
+
+
+def _claim_summaries(pack: EvidencePack) -> list[dict]:
+    return [
+        {
+            "type": "claim",
+            "evidence_id": claim.id,
+            "source_file": claim.source_file,
+            "page": claim.page,
+            "text": _truncate(claim.text),
+            "supporting_evidence_ids": claim.supporting_evidence_ids,
+            "confidence": claim.confidence,
+        }
+        for claim in pack.claims[:24]
+    ]
+
+
+def _truncate(value: str, *, limit: int = 360) -> str:
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "..."
+
+
+def _build_ingest_evidence(*, input_path: Path, parser: IngestParser, workdir: Path, mineru_options: MinerUOptions | None = None):
+    source = Path(input_path)
+    if not source.exists():
+        raise ValueError(f"input file does not exist: {source}")
+
+    selected_parser = _resolve_ingest_parser(source, parser)
+    if selected_parser == IngestParser.MARKDOWN:
+        parse_result = MarkdownParser().parse(source)
+    elif selected_parser == IngestParser.MINERU:
+        parse_result = MinerUAdapter(options=mineru_options).parse(source, workdir)
+    else:
+        raise ValueError(f"unsupported parser: {parser.value}")
+
+    return EvidenceBuilder().build(parse_result)
+
+
+def _resolve_ingest_parser(input_path: Path, parser: IngestParser) -> IngestParser:
+    if parser != IngestParser.AUTO:
+        return parser
+
+    suffix = input_path.suffix.lower()
+    if suffix == ".md":
+        return IngestParser.MARKDOWN
+    if suffix == ".pdf":
+        return IngestParser.MINERU
+    raise ValueError(f"unsupported input format for auto parser: {input_path.suffix or '<none>'}; use .md or .pdf")
+
+
+def _mineru_status() -> dict:
+    path = shutil.which("mineru")
+    try:
+        package_version = metadata.version("mineru")
+    except metadata.PackageNotFoundError:
+        package_version = None
+
+    cli_version = None
+    error = None
+    if path:
+        try:
+            completed = subprocess.run([path, "--version"], check=True, capture_output=True, text=True)
+            cli_version = (completed.stdout or completed.stderr).strip() or None
+        except (OSError, subprocess.CalledProcessError) as exc:
+            error = str(exc)
+
+    return {
+        "command_found": path is not None,
+        "path": path,
+        "package_version": package_version,
+        "cli_version": cli_version,
+        "error": error,
+    }
 
 
 def _project_memory_metadata(*, memory: dict, failures: dict) -> dict | None:

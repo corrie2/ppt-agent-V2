@@ -29,6 +29,73 @@ ppt-agent build plan.json --out deck.pptx
 ppt-agent run "Quarterly product roadmap" --mode plan
 ```
 
+## Document-to-Deck MVP
+
+PPT Agent can generate a traceable PPTX from document evidence. The document flow converts Markdown or parser output into `evidence.json`, creates a schema-versioned `plan.json` with citations where evidence is available, builds a PPTX, and runs deterministic QA/repair on the plan.
+
+Ingest Markdown:
+
+```bash
+ppt-agent ingest input.md --out .ppt-agent/evidence.json
+```
+
+Ingest a PDF through MinerU:
+
+```bash
+ppt-agent ingest paper.pdf --parser mineru --workdir .ppt-agent/parsed --out .ppt-agent/evidence.json
+```
+
+Check whether the local MinerU runtime is available:
+
+```bash
+ppt-agent doctor
+```
+
+The PDF ingest command defaults to MinerU's `pipeline` backend and `auto` method for a local-first CPU-capable path. You can pass MinerU options when needed:
+
+```bash
+ppt-agent ingest paper.pdf --parser mineru --mineru-backend pipeline --mineru-method ocr --mineru-lang en --out .ppt-agent/evidence.json
+```
+
+Plan from evidence:
+
+```bash
+ppt-agent plan --evidence .ppt-agent/evidence.json --spec plan.json
+```
+
+Build with evidence-backed figures and source trace:
+
+```bash
+ppt-agent build plan.json --evidence .ppt-agent/evidence.json --out deck.pptx
+```
+
+Run deterministic Document-to-Deck QA:
+
+```bash
+ppt-agent qa plan.json --evidence .ppt-agent/evidence.json --out qa_report.json
+```
+
+Repair the plan from QA findings:
+
+```bash
+ppt-agent repair plan.json --qa qa_report.json --evidence .ppt-agent/evidence.json --out repaired_plan.json
+```
+
+Intermediate files:
+
+- `evidence.json`: structured source evidence extracted from Markdown or parser output, including sections, figures, tables, claims, and source references.
+- `plan.json`: schema-versioned deck plan. PlanSpec v2 slides can include `role`, `message`, `layout`, `content.figure_ids`, and `citations`.
+- `qa_report.json`: deterministic QA report for document-to-deck checks such as missing citations, missing figure assets, too many bullets, empty messages, and layout/content mismatches.
+
+MinerU is optional. If MinerU is not installed, use Markdown input or pre-created/mock parser output. PDF parsing with `--parser mineru` requires the user to install MinerU separately and make the `mineru` command available on `PATH`.
+
+Current limitations:
+
+- PDF understanding depends on parser output quality and is not guaranteed to work perfectly for every PDF.
+- The pipeline does not recover original LaTeX source.
+- The system does not automatically verify every factual claim.
+- Source trace quality depends on whether the parser provides useful source files, pages, captions, and evidence IDs.
+
 LLM planner setup:
 
 ```bash

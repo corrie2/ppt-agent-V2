@@ -7,6 +7,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.util import Inches, Pt
 
+from ppt_agent.domain.evidence import EvidenceItem, EvidencePack, FigureAsset
 from ppt_agent.domain.models import Artifact, PptSpec, SlideSpec
 
 SLIDE_WIDTH = Inches(13.333)
@@ -22,26 +23,39 @@ WHITE = RGBColor(255, 255, 255)
 GRAY = RGBColor(110, 122, 138)
 
 
-def build_pptx(spec: PptSpec, output_path: Path) -> Artifact:
+def build_pptx(
+    spec: PptSpec,
+    output_path: Path,
+    evidence_pack: EvidencePack | None = None,
+    evidence_path: Path | None = None,
+) -> Artifact:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     prs = Presentation()
     prs.slide_width = SLIDE_WIDTH
     prs.slide_height = SLIDE_HEIGHT
+    figures_by_id = _figures_by_id(evidence_pack)
+    evidence_by_id = _evidence_by_id(evidence_pack)
 
     for slide_spec in spec.slides:
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         _paint_background(slide, spec.theme)
         layout = _resolve_layout(slide_spec)
-        _render_layout(slide, slide_spec, layout)
-        if slide_spec.speaker_notes:
-            slide.notes_slide.notes_text_frame.text = slide_spec.speaker_notes
+        if figures_by_id:
+            _render_layout(slide, slide_spec, layout, figures_by_id=figures_by_id, evidence_path=evidence_path)
+        else:
+            _render_layout(slide, slide_spec, layout)
+        notes_text = _speaker_notes_with_source_trace(slide_spec, evidence_by_id=evidence_by_id)
+        if notes_text:
+            slide.notes_slide.notes_text_frame.text = notes_text
 
     prs.save(output_path)
     return Artifact(path=output_path)
 
 
 def _resolve_layout(slide_spec: SlideSpec) -> str:
+    if slide_spec.layout == "figure_with_caption" or slide_spec.content.figure_ids:
+        return "figure_with_caption"
     if slide_spec.layout_hint:
         return slide_spec.layout_hint
     mapping = {
@@ -56,7 +70,14 @@ def _resolve_layout(slide_spec: SlideSpec) -> str:
     return mapping.get(slide_spec.visual_type, "two_column_text_image")
 
 
-def _render_layout(slide, slide_spec: SlideSpec, layout: str) -> None:
+def _render_layout(
+    slide,
+    slide_spec: SlideSpec,
+    layout: str,
+    *,
+    figures_by_id: dict[str, FigureAsset] | None = None,
+    evidence_path: Path | None = None,
+) -> None:
     renderer = {
         "title_cover": _render_title_cover,
         "hero_image_plus_argument": _render_hero_image_plus_argument,
@@ -64,8 +85,15 @@ def _render_layout(slide, slide_spec: SlideSpec, layout: str) -> None:
         "three_card_summary": _render_three_card_summary,
         "process_timeline": _render_process_timeline,
         "comparison_table": _render_comparison_table,
-    }.get(layout, _render_two_column_text_image)
-    renderer(slide, slide_spec)
+        "figure_with_caption": _render_figure_with_caption,
+    }.get(layout)
+    if renderer is None:
+        _render_two_column_text_image(slide, slide_spec)
+        return
+    if layout == "figure_with_caption":
+        renderer(slide, slide_spec, figures_by_id=figures_by_id or {}, evidence_path=evidence_path)
+    else:
+        renderer(slide, slide_spec)
 
 
 def _render_title_cover(slide, slide_spec: SlideSpec) -> None:
@@ -159,6 +187,39 @@ def _render_comparison_table(slide, slide_spec: SlideSpec) -> None:
             cell.fill.solid()
             cell.fill.fore_color.rgb = WHITE if row_idx % 2 else LIGHT
             _style_cell(cell, False, DARK)
+
+
+def _render_figure_with_caption(
+    slide,
+    slide_spec: SlideSpec,
+    *,
+    figures_by_id: dict[str, FigureAsset],
+    evidence_path: Path | None,
+) -> None:
+    _add_section_title(slide, slide_spec.title)
+    figure_id = slide_spec.content.figure_ids[0] if slide_spec.content.figure_ids else None
+    figure = figures_by_id.get(figure_id or "")
+    image_path = _resolve_evidence_asset_path(figure.path, evidence_path=evidence_path) if figure and figure.path else None
+    has_bullets = bool(slide_spec.bullets)
+
+    image_left = Inches(0.85)
+    image_top = Inches(1.25)
+    image_width = Inches(7.5 if has_bullets else 11.6)
+    image_height = Inches(4.75)
+    caption_top = Inches(6.1)
+
+    if image_path and image_path.exists():
+        slide.shapes.add_picture(str(image_path), image_left, image_top, width=image_width, height=image_height)
+    else:
+        _draw_missing_figure_placeholder(slide, slide_spec, image_left, image_top, image_width, image_height, figure_id=figure_id)
+
+    caption = _figure_caption(figure, slide_spec, figure_id=figure_id)
+    _add_textbox(slide, image_left, caption_top, image_width, Inches(0.55), caption, 10, False, GRAY)
+
+    if has_bullets:
+        message = slide_spec.core_message or slide_spec.message or slide_spec.objective
+        _add_textbox(slide, Inches(8.65), Inches(1.35), Inches(3.65), Inches(0.9), message, 16, True, NAVY)
+        _add_textbox(slide, Inches(8.65), Inches(2.3), Inches(3.65), Inches(3.0), _join_lines(slide_spec.bullets[:4]), 13, False, DARK)
 
 
 def _paint_background(slide, theme: str) -> None:
@@ -268,6 +329,100 @@ def _draw_two_column_fallback(slide, slide_spec: SlideSpec, left, top, width, he
     message = slide_spec.image_caption or slide_spec.core_message or slide_spec.objective or slide_spec.title
     caption = slide.shapes.add_textbox(left + Inches(0.7), top + Inches(3.6), width - Inches(1.4), Inches(1.0))
     _set_text(caption.text_frame, message, 16, False, DARK, center=True)
+
+
+def _draw_missing_figure_placeholder(slide, slide_spec: SlideSpec, left, top, width, height, *, figure_id: str | None) -> None:
+    frame = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, width, height)
+    frame.fill.solid()
+    frame.fill.fore_color.rgb = WHITE
+    frame.line.color.rgb = TEAL
+    message = f"Figure image missing: {figure_id or 'no figure_id'}"
+    if slide_spec.image_caption:
+        message = f"{message}\n{slide_spec.image_caption}"
+    _set_text(frame.text_frame, message, 18, True, NAVY, center=True)
+
+
+def _resolve_evidence_asset_path(path: str, *, evidence_path: Path | None) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute() or evidence_path is None:
+        return candidate
+    if candidate.exists():
+        return candidate
+    return evidence_path.parent / candidate
+
+
+def _figures_by_id(evidence_pack: EvidencePack | None) -> dict[str, FigureAsset]:
+    if evidence_pack is None:
+        return {}
+    return {figure.id: figure for figure in evidence_pack.figures}
+
+
+def _evidence_by_id(evidence_pack: EvidencePack | None) -> dict[str, EvidenceItem]:
+    if evidence_pack is None:
+        return {}
+    return {item.id: item for item in evidence_pack.evidence_items()}
+
+
+def _speaker_notes_with_source_trace(slide_spec: SlideSpec, *, evidence_by_id: dict[str, EvidenceItem]) -> str:
+    lines = _source_trace_lines(slide_spec, evidence_by_id=evidence_by_id)
+    if not lines:
+        return slide_spec.speaker_notes
+    parts = []
+    if slide_spec.speaker_notes.strip():
+        parts.append(slide_spec.speaker_notes.strip())
+    parts.append("Source Trace:\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def _source_trace_lines(slide_spec: SlideSpec, *, evidence_by_id: dict[str, EvidenceItem]) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for citation in slide_spec.citations:
+        line = _format_source_trace(citation.evidence_id, source_file=citation.source_file, page=citation.page, evidence_by_id=evidence_by_id)
+        if line not in seen:
+            lines.append(line)
+            seen.add(line)
+    return lines
+
+
+def _format_source_trace(
+    evidence_id: str,
+    *,
+    source_file: str | None,
+    page: int | None,
+    evidence_by_id: dict[str, EvidenceItem],
+) -> str:
+    item = evidence_by_id.get(evidence_id)
+    if item is None:
+        if source_file:
+            page_text = f" p.{page}" if page is not None else ""
+            return f"Source: {source_file}{page_text} {evidence_id} unresolved"
+        return f"Source: unresolved {evidence_id}"
+
+    resolved_source = source_file or item.source_file
+    resolved_page = page if page is not None else item.page
+    page_text = f" p.{resolved_page}" if resolved_page is not None else ""
+    caption = _evidence_caption(item)
+    caption_text = f" - {caption}" if caption else ""
+    return f"Source: {resolved_source}{page_text} {evidence_id}{caption_text}"
+
+
+def _evidence_caption(item: EvidenceItem) -> str:
+    for attr in ("caption", "heading", "text"):
+        value = getattr(item, attr, None)
+        if value:
+            text = " ".join(str(value).split())
+            return text[:120]
+    return ""
+
+
+def _figure_caption(figure: FigureAsset | None, slide_spec: SlideSpec, *, figure_id: str | None) -> str:
+    if figure is None:
+        return f"Source: missing figure evidence for {figure_id or 'unspecified figure'}"
+    caption = figure.caption or slide_spec.image_caption or figure.text or figure.id
+    source = figure.source_file
+    page = f", p. {figure.page}" if figure.page is not None else ""
+    return f"{caption} | Source: {source}{page}"
 
 
 def _add_picture(slide, image_path: str, left, top, width, height, *, caption: str = "") -> None:

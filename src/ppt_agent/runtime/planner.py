@@ -11,12 +11,17 @@ def build_plan_spec(
     provider: str | None = None,
     model: str | None = None,
 ) -> PptSpec:
+    if intent.source_digest and intent.source_digest.get("type") == "evidence_pack" and provider is None and model is None:
+        return deterministic_plan_spec(intent)
+
     resolved_provider, resolved_model = resolve_planner_selection(provider=provider, model=model)
     if not resolved_provider or not resolved_model:
         return deterministic_plan_spec(intent)
 
     api_key = load_api_key(resolved_provider)
     if not api_key:
+        if intent.source_digest:
+            return deterministic_plan_spec(intent)
         raise PlannerConfigError(
             f"missing API key for provider {resolved_provider}. Run `ppt-agent llm set-key {resolved_provider} --api-key <key>`."
         )
@@ -61,6 +66,8 @@ def test_planner_connection(*, provider: str | None = None, model: str | None = 
 def deterministic_plan_spec(intent: DeckIntent) -> PptSpec:
     topic = intent.topic.strip()
     if intent.source_digest:
+        if intent.source_digest.get("type") == "evidence_pack":
+            return _evidence_grounded_plan_spec(intent)
         return _academic_grounded_plan_spec(intent)
     style_tags = _memory_style_tags(intent)
     return PptSpec(
@@ -287,6 +294,175 @@ def _academic_grounded_plan_spec(intent: DeckIntent) -> PptSpec:
         output_format=intent.output_format,
         grounding_warnings=digest.get("warnings", []),
     )
+
+
+def _evidence_grounded_plan_spec(intent: DeckIntent) -> PptSpec:
+    digest = intent.source_digest or {}
+    items = digest.get("evidence_items") or []
+    sections = [item for item in items if item.get("type") == "section"]
+    figures = [item for item in items if item.get("type") == "figure"]
+    tables = [item for item in items if item.get("type") == "table"]
+    claims = [item for item in items if item.get("type") == "claim"]
+    title = _evidence_title(intent, digest)
+
+    primary = _first_evidence(claims, sections, tables, figures)
+    problem = _find_evidence(sections, ("problem", "motivation", "background", "introduction")) or primary
+    method = _find_evidence(sections, ("method", "approach", "system", "summary")) or _first_evidence(sections, claims, tables, figures)
+    takeaway = _find_evidence(claims + sections, ("result", "conclusion", "takeaway", "discussion")) or primary
+
+    slides = [
+        SlideSpec(
+            id="slide-001",
+            role="title",
+            title=title,
+            message="This deck is grounded in the supplied evidence pack.",
+            layout="title_cover",
+            content={"bullets": [_evidence_bullet(primary, fallback="Review the supplied evidence and its source trail.")]},
+            citations=_citation_list(primary),
+            visual_type="cover",
+            grounding_status=_grounding_status(primary),
+            source_notes="Generated from evidence.json; unavailable details are omitted.",
+        ),
+        SlideSpec(
+            id="slide-002",
+            role="problem",
+            title="Problem / Motivation",
+            message=_evidence_message(problem, fallback="The evidence establishes the motivation for the deck."),
+            layout="two_column_text_image",
+            content={"bullets": _evidence_bullets([problem, primary], fallback="Use the supplied evidence to frame the motivation.")},
+            citations=_citation_list(problem),
+            visual_type="editorial_diagram",
+            grounding_status=_grounding_status(problem),
+            source_notes="Motivation slide cites the closest matching section or claim.",
+        ),
+        SlideSpec(
+            id="slide-003",
+            role="method_summary",
+            title="Method / Summary",
+            message=_evidence_message(method, fallback="The evidence summarizes the approach or central content."),
+            layout="two_column_text_image",
+            content={"bullets": _evidence_bullets([method, primary], fallback="Summarize only details present in evidence.")},
+            citations=_citation_list(method),
+            visual_type="process_timeline",
+            grounding_status=_grounding_status(method),
+            source_notes="Method slide uses section evidence when available.",
+        ),
+    ]
+
+    if figures:
+        figure = figures[0]
+        slides.append(
+            SlideSpec(
+                id=f"slide-{len(slides) + 1:03d}",
+                role="figure_evidence",
+                title="Figure Evidence",
+                message=_evidence_message(figure, fallback="The available figure provides visual evidence."),
+                layout="figure_with_caption",
+                content={
+                    "bullets": _evidence_bullets([figure], fallback="Use the figure caption as the supported visual summary."),
+                    "figure_ids": [figure["evidence_id"]],
+                },
+                citations=_citation_list(figure),
+                visual_type="figure_with_caption",
+                image_caption=figure.get("caption") or figure.get("text") or "",
+                grounding_status="grounded",
+                source_notes="Figure slide references an existing figure evidence_id.",
+            )
+        )
+
+    slides.append(
+        SlideSpec(
+            id=f"slide-{len(slides) + 1:03d}",
+            role="takeaways",
+            title="Takeaways",
+            message=_evidence_message(takeaway, fallback="The takeaways are limited to the supplied evidence."),
+            layout="three_card_summary",
+            content={"bullets": _evidence_bullets([takeaway, method, problem], fallback="Do not add claims beyond the evidence pack.")},
+            citations=_citation_list(takeaway),
+            visual_type="three_card_summary",
+            grounding_status=_grounding_status(takeaway),
+            source_notes="Takeaways cite the strongest available evidence item.",
+        )
+    )
+
+    return PptSpec(
+        schema_version=2,
+        title=title,
+        audience=intent.audience,
+        goal="Create a traceable deck from the supplied evidence pack.",
+        narrative="Evidence-backed progression from motivation to method, visual evidence, and takeaways.",
+        theme="executive_blue",
+        slides=slides,
+        source_digest=digest,
+        applied_skills=intent.applied_skills,
+        output_format=intent.output_format,
+    )
+
+
+def _evidence_title(intent: DeckIntent, digest: dict) -> str:
+    for source in digest.get("sources") or []:
+        title = source.get("title")
+        if title:
+            return title
+    return intent.topic.strip()
+
+
+def _find_evidence(items: list[dict], keywords: tuple[str, ...]) -> dict | None:
+    for item in items:
+        haystack = " ".join(str(item.get(key) or "") for key in ("heading", "caption", "text")).lower()
+        if any(keyword in haystack for keyword in keywords):
+            return item
+    return None
+
+
+def _first_evidence(*groups: list[dict]) -> dict | None:
+    for group in groups:
+        if group:
+            return group[0]
+    return None
+
+
+def _evidence_message(item: dict | None, *, fallback: str) -> str:
+    if not item:
+        return fallback
+    for key in ("heading", "caption", "text"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value[:180]
+    return fallback
+
+
+def _evidence_bullet(item: dict | None, *, fallback: str) -> str:
+    return _evidence_message(item, fallback=fallback)
+
+
+def _evidence_bullets(items: list[dict | None], *, fallback: str) -> list[str]:
+    bullets: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        bullet = _evidence_bullet(item, fallback="")
+        if bullet and bullet not in seen:
+            bullets.append(bullet)
+            seen.add(bullet)
+        if len(bullets) >= 3:
+            break
+    return bullets or [fallback]
+
+
+def _citation_list(item: dict | None) -> list[dict]:
+    if not item or not item.get("evidence_id"):
+        return []
+    return [
+        {
+            "evidence_id": item["evidence_id"],
+            "page": item.get("page"),
+            "source_file": item.get("source_file"),
+        }
+    ]
+
+
+def _grounding_status(item: dict | None) -> str:
+    return "grounded" if item and item.get("evidence_id") else "partial"
 
 
 def _memory_style_tags(intent: DeckIntent) -> list[str]:

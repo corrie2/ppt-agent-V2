@@ -58,6 +58,7 @@ def build_plan_payload(
         "schema_version": PLAN_SCHEMA_VERSION,
         "request": intent.model_dump(mode="json"),
         "title": spec.title,
+        "audience": spec.audience,
         "theme": resolved_theme,
         "outline": [slide.title for slide in spec.slides],
         "slides": [slide.model_dump(mode="json") for slide in spec.slides],
@@ -65,6 +66,10 @@ def build_plan_payload(
         "approved": approved,
         "transitions": transitions,
     }
+    if spec.goal:
+        payload["goal"] = spec.goal
+    if spec.narrative:
+        payload["narrative"] = spec.narrative
     extra = metadata or {}
     if spec.output_format != "pptx" or extra.get("output_format"):
         payload["output_format"] = extra.get("output_format") or spec.output_format
@@ -118,10 +123,14 @@ def read_plan_document(path: Path) -> PlanDocument:
     try:
         # Canonical plan/spec document with an explicit schema_version.
         if isinstance(raw, dict) and "schema_version" in raw:
+            request = raw.get("request") or {}
             spec = PptSpec.model_validate(
                 {
+                    "schema_version": raw.get("schema_version"),
                     "title": raw.get("title"),
-                    "audience": (raw.get("request") or {}).get("audience", "general business audience"),
+                    "audience": raw.get("audience") or request.get("audience", "general business audience"),
+                    "goal": raw.get("goal"),
+                    "narrative": raw.get("narrative"),
                     "theme": raw.get("theme") or "executive_blue",
                     "slides": raw.get("slides"),
                     "source_digest": raw.get("source_digest"),
