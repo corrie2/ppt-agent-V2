@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import zipfile
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -53,8 +55,83 @@ def write_document_qa_report(report: DocumentQaReport, path: Path) -> None:
     path.write_text(json.dumps(report.model_dump(mode="json"), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def run_pptx_render_qa(
+    spec: PptSpec,
+    *,
+    pptx_path: Path,
+    debug_source_trace: bool = False,
+) -> DocumentQaReport:
+    issues: list[DocumentQaIssue] = []
+    slide_xml_by_index = _read_slide_xml(pptx_path)
+    for index, slide in enumerate(spec.slides, start=1):
+        slide_id = slide.id or f"slide-{index:03d}"
+        xml = slide_xml_by_index.get(index, "")
+        text = _xml_text(xml)
+        if slide.content.figure_ids and "<p:pic" not in xml:
+            issues.append(
+                DocumentQaIssue(
+                    id=f"{slide_id}:render_missing_picture_shape",
+                    severity="warning",
+                    slide_id=slide_id,
+                    message="Slide has figure_ids but the rendered PPTX slide has no picture shape.",
+                    suggested_fix="Verify figure paths in evidence.json and ensure the renderer can add_picture.",
+                )
+            )
+        if slide.content.table_ids and "<a:tbl" not in xml and "Table summary" not in text:
+            issues.append(
+                DocumentQaIssue(
+                    id=f"{slide_id}:render_missing_table_summary",
+                    severity="warning",
+                    slide_id=slide_id,
+                    message="Slide has table_ids but the rendered PPTX slide has no table shape or table summary.",
+                    suggested_fix="Use result_table_summary or render a compact table summary for table evidence.",
+                )
+            )
+        if not debug_source_trace and "Source Trace" in text:
+            issues.append(
+                DocumentQaIssue(
+                    id=f"{slide_id}:source_trace_visible",
+                    severity="warning",
+                    slide_id=slide_id,
+                    message="Rendered slide body contains full Source Trace in non-debug mode.",
+                    suggested_fix="Keep full source trace in debug notes only and render a compact footer.",
+                )
+            )
+        if len(slide.bullets) > 3:
+            issues.append(
+                DocumentQaIssue(
+                    id=f"{slide_id}:visible_body_over_budget",
+                    severity="warning",
+                    slide_id=slide_id,
+                    message="Slide plan contains more than three body bullets; renderer should cap visible body text.",
+                    suggested_fix="Keep visible slide body to at most three points and move details to speaker notes.",
+                )
+            )
+        if _has_template_residue(text):
+            issues.append(
+                DocumentQaIssue(
+                    id=f"{slide_id}:template_number_residue",
+                    severity="warning",
+                    slide_id=slide_id,
+                    message="Rendered slide appears to contain fixed 01/02/03 template residue.",
+                    suggested_fix="Use role-specific section labels instead of fixed numeric placeholders.",
+                )
+            )
+    return DocumentQaReport(ok=not any(issue.severity == "error" for issue in issues), issues=issues)
+
+
 def _slide_message_issues(slide: SlideSpec, *, slide_id: str) -> list[DocumentQaIssue]:
     issues: list[DocumentQaIssue] = []
+    if not _is_cover_slide(slide) and not slide.citations:
+        issues.append(
+            DocumentQaIssue(
+                id=f"{slide_id}:missing_citations",
+                severity="error",
+                slide_id=slide_id,
+                message="Non-cover slide has no citations.",
+                suggested_fix="Add at least one citation with an evidence_id from evidence.json.",
+            )
+        )
     if _is_key_claim_slide(slide) and not slide.citations:
         issues.append(
             DocumentQaIssue(
@@ -68,11 +145,30 @@ def _slide_message_issues(slide: SlideSpec, *, slide_id: str) -> list[DocumentQa
     if not (slide.message or slide.core_message or "").strip():
         issues.append(
             DocumentQaIssue(
+                id=f"{slide_id}:missing_slide_message",
+                severity="error",
+                slide_id=slide_id,
+                message="Slide message is empty.",
+                suggested_fix="Add a concise message summarizing the slide's point.",
+            )
+        )
+        issues.append(
+            DocumentQaIssue(
                 id=f"{slide_id}:empty_message",
                 severity="error",
                 slide_id=slide_id,
                 message="Slide message is empty.",
                 suggested_fix="Add a concise message summarizing the slide's point.",
+            )
+        )
+    elif _is_generic_message(slide):
+        issues.append(
+            DocumentQaIssue(
+                id=f"{slide_id}:message_too_generic",
+                severity="warning",
+                slide_id=slide_id,
+                message="Slide message is too generic for a paper explanation deck.",
+                suggested_fix="Make the message name the paper-specific method, result, dataset, or claim.",
             )
         )
     return issues
@@ -144,39 +240,112 @@ def _figure_issues(
 
 def _content_shape_issues(slide: SlideSpec, *, slide_id: str) -> list[DocumentQaIssue]:
     issues: list[DocumentQaIssue] = []
-    if len(slide.bullets) > 5:
+    if len(slide.bullets) > 3:
         issues.append(
             DocumentQaIssue(
                 id=f"{slide_id}:too_many_bullets",
                 severity="warning",
                 slide_id=slide_id,
                 message=f"Slide has too many bullets: {len(slide.bullets)}.",
-                suggested_fix="Reduce the slide to five or fewer bullets.",
+                suggested_fix="Reduce the slide to three or fewer bullets.",
             )
         )
 
     layout = (slide.layout or slide.layout_hint or "").strip()
-    if slide.content.figure_ids and layout != "figure_with_caption":
+    figure_layouts = {"figure_walkthrough", "figure_with_caption", "method_figure_callouts"}
+    if slide.content.figure_ids and layout not in figure_layouts:
         issues.append(
             DocumentQaIssue(
                 id=f"{slide_id}:layout_content_mismatch",
                 severity="warning",
                 slide_id=slide_id,
-                message="Slide has figure_ids but does not use figure_with_caption layout.",
-                suggested_fix="Set layout to figure_with_caption or remove content.figure_ids.",
+                message="Slide has figure_ids but does not use a figure walkthrough layout.",
+                suggested_fix="Set layout to figure_walkthrough or remove content.figure_ids.",
             )
         )
-    if layout == "figure_with_caption" and not slide.content.figure_ids:
+    if layout in figure_layouts and not slide.content.figure_ids:
         issues.append(
             DocumentQaIssue(
                 id=f"{slide_id}:layout_content_mismatch",
                 severity="warning",
                 slide_id=slide_id,
-                message="figure_with_caption layout has no figure_ids.",
+                message="Figure layout has no figure_ids.",
                 suggested_fix="Add a figure_id from evidence.json or choose a non-figure layout.",
             )
         )
+    if slide.content.figure_ids and not slide.content.visual_reason.strip():
+        issues.append(
+            DocumentQaIssue(
+                id=f"{slide_id}:figure_without_visual_reason",
+                severity="warning",
+                slide_id=slide_id,
+                message="Slide references figure_ids but content.visual_reason is empty.",
+                suggested_fix="Explain why the selected figure supports the slide message.",
+            )
+        )
+    if slide.content.figure_ids == ["fig_001"] and not slide.content.visual_reason.strip():
+        issues.append(
+            DocumentQaIssue(
+                id=f"{slide_id}:default_first_figure_suspicious",
+                severity="warning",
+                slide_id=slide_id,
+                message="Slide uses only fig_001 without a visual selection reason.",
+                suggested_fix="Confirm the first figure is truly the best visual or choose a more specific figure.",
+            )
+        )
+    if _is_result_slide(slide) and not (slide.content.table_ids or slide.content.metrics or slide.content.result_summary):
+        issues.append(
+            DocumentQaIssue(
+                id=f"{slide_id}:result_slide_without_result_evidence",
+                severity="warning",
+                slide_id=slide_id,
+                message="Result slide has no table_ids, metrics, or result_summary.",
+                suggested_fix="Ground result slides in a table, metric list, or structured result summary.",
+            )
+        )
+    grounding_status = (slide.content.grounding_status or slide.grounding_status or "").lower()
+    if grounding_status == "needs_verification":
+        issues.append(
+            DocumentQaIssue(
+                id=f"{slide_id}:needs_verification",
+                severity="warning",
+                slide_id=slide_id,
+                message="Slide is marked as needs_verification.",
+                suggested_fix="Review the slide against evidence before presenting.",
+            )
+        )
     return issues
+
+
+def _is_cover_slide(slide: SlideSpec) -> bool:
+    text = " ".join([slide.role, slide.layout, slide.layout_hint, slide.visual_type]).lower()
+    return any(token in text for token in ("title", "cover"))
+
+
+def _is_result_slide(slide: SlideSpec) -> bool:
+    text = " ".join([slide.role, slide.layout, slide.layout_hint, slide.title]).lower()
+    return any(token in text for token in ("result", "performance", "comparison"))
+
+
+def _is_generic_message(slide: SlideSpec) -> bool:
+    message = (slide.message or slide.core_message or "").strip().lower()
+    if not message or message != slide.title.strip().lower():
+        generic_phrases = (
+            "this slide",
+            "key takeaways",
+            "main results",
+            "method overview",
+            "problem and motivation",
+            "the evidence establishes",
+        )
+        if not any(phrase in message for phrase in generic_phrases):
+            return False
+    specific_tokens = {
+        token.strip(".,:;()[]{}").lower()
+        for token in " ".join([slide.title, *slide.bullets]).split()
+        if len(token.strip(".,:;()[]{}")) >= 8
+    }
+    return len(specific_tokens) < 2
 
 
 def _is_key_claim_slide(slide: SlideSpec) -> bool:
@@ -203,4 +372,39 @@ def _resolve_asset_path(path: str, *, evidence_path: Path | None) -> Path:
     candidate = Path(path)
     if candidate.is_absolute() or evidence_path is None:
         return candidate
+    if candidate.exists():
+        return candidate
     return evidence_path.parent / candidate
+
+
+def _read_slide_xml(pptx_path: Path) -> dict[int, str]:
+    try:
+        with zipfile.ZipFile(pptx_path) as archive:
+            names = sorted(
+                (
+                    name
+                    for name in archive.namelist()
+                    if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+                ),
+                key=_slide_xml_sort_key,
+            )
+            return {
+                index: archive.read(name).decode("utf-8", errors="ignore")
+                for index, name in enumerate(names, start=1)
+            }
+    except (OSError, zipfile.BadZipFile):
+        return {}
+
+
+def _slide_xml_sort_key(name: str) -> int:
+    match = re.search(r"slide(\d+)\.xml$", name)
+    return int(match.group(1)) if match else 0
+
+
+def _xml_text(xml: str) -> str:
+    return " ".join(re.findall(r"<a:t>(.*?)</a:t>", xml, flags=re.DOTALL))
+
+
+def _has_template_residue(text: str) -> bool:
+    tokens = set(re.findall(r"\b0?[123]\b", text))
+    return {"01", "02", "03"} <= tokens or {"1", "02", "03"} <= tokens

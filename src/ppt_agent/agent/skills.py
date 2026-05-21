@@ -8,8 +8,15 @@ from pydantic import BaseModel, Field
 from ppt_agent.agent.skill_registry import SkillDefinition
 from ppt_agent.domain.models import AgentMode, AgentState, DeckIntent, PptSpec, SlideSpec
 from ppt_agent.graph.agent import create_agent_graph
+from ppt_agent.runtime.evidence_ingest import (
+    attach_evidence_figures_to_spec,
+    ensure_mineru_evidence_for_source,
+    evidence_digest,
+    load_evidence_pack,
+)
 from ppt_agent.runtime.html_deck import build_html_deck, validate_html_deck
 from ppt_agent.runtime.pptx import build_pptx
+from ppt_agent.runtime.visual_quality import evaluate_pptx_visual_quality, visual_quality_report_path
 from ppt_agent.runtime.source_store import append_memory_event, digest_sources, index_source, ingest_sources, retrieve_source_context
 from ppt_agent.runtime.workspace import scan_workspace
 from ppt_agent.storage.project_memory import (
@@ -39,6 +46,7 @@ class GeneratePlanInput(BaseModel):
     tone: str | None = None
     plan_path: str | None = None
     output_format: str | None = None
+    output_name: str | None = None
     applied_skills: list[str] | None = None
     theme: str | None = None
     skill_root: str | None = None
@@ -205,9 +213,19 @@ def register_default_skills(registry, *, session: ShellSession) -> None:
 
 
 def scan_workspace_skill(*, session: ShellSession, max_depth: int = 3) -> dict[str, Any]:
-    files = scan_workspace(session.input_dir, max_depth=max_depth)
-    session.discovered_sources = [item.model_dump(mode="json") for item in files]
-    return {"files": session.discovered_sources, "reply": f"Discovered {len(files)} source files in {session.input_dir}."}
+    files_by_path: dict[str, dict[str, Any]] = {}
+    for root, depth in ((session.input_dir, max_depth), (session.cwd, 1)):
+        for item in scan_workspace(root, max_depth=depth):
+            data = item.model_dump(mode="json")
+            files_by_path[data["path"]] = data
+    session.discovered_sources = sorted(
+        files_by_path.values(),
+        key=lambda item: (item["file_type"], item.get("relative_path") or item["name"]),
+    )
+    return {
+        "files": session.discovered_sources,
+        "reply": f"Discovered {len(session.discovered_sources)} source files in {session.input_dir} and project root.",
+    }
 
 
 def list_sources_skill(*, session: ShellSession) -> dict[str, Any]:
@@ -225,6 +243,7 @@ def generate_plan_skill(
     tone: str | None = None,
     plan_path: str | None = None,
     output_format: str | None = None,
+    output_name: str | None = None,
     applied_skills: list[str] | None = None,
     theme: str | None = None,
     skill_root: str | None = None,
@@ -252,7 +271,16 @@ def generate_plan_skill(
     resolved_source_digest = source_digest
     resolved_source_context = list(source_context or [])
     if used_sources and resolved_source_digest is None:
-        resolved_source_digest = digest_pdf_sources_skill(session=session, sources=used_sources).get("source_digest")
+        evidence_pack, evidence_path, evidence_warnings = _prepare_evidence_pack(session, used_sources)
+        if evidence_warnings:
+            session.latest_evidence_warnings = evidence_warnings
+        if evidence_pack is not None:
+            session.latest_evidence_path = str(evidence_path) if evidence_path else None
+            resolved_source_digest = evidence_digest(evidence_pack, evidence_path=evidence_path)
+            if evidence_warnings:
+                resolved_source_digest["warnings"] = evidence_warnings
+        else:
+            resolved_source_digest = digest_pdf_sources_skill(session=session, sources=used_sources).get("source_digest")
     if used_sources and not resolved_source_context:
         context_result = retrieve_source_context_skill(session=session, sources=used_sources, query=topic, limit=5)
         resolved_source_context = context_result.get("contexts", [])
@@ -272,6 +300,7 @@ def generate_plan_skill(
             "slides": slides,
             "min_slides": min_slides,
             "output_format": resolved_output_format,
+            "output_name": output_name,
             "applied_skills": applied,
             "theme": resolved_theme,
             "skill_root": skill_root,
@@ -296,9 +325,14 @@ def generate_plan_skill(
         mode=AgentMode.PLAN,
         planner_provider=session.assistant_provider if use_assistant_planner else None,
         planner_model=session.assistant_model if use_assistant_planner else None,
+        allow_fallback=not use_assistant_planner,
     )
     result = graph.invoke(state.model_dump(mode="json"))
     spec = PptSpec.model_validate(result["spec"])
+    evidence_pack_for_render = None
+    if resolved_source_digest and resolved_source_digest.get("type") == "evidence_pack":
+        evidence_pack_for_render, _, _ = load_evidence_pack(resolved_source_digest.get("path"))
+        spec = attach_evidence_figures_to_spec(spec, evidence_pack_for_render)
     resolved_audience = audience or spec.audience
     minimum_slides = max(slides or 0, min_slides or 0)
     spec = _normalize_spec(spec, topic=topic, audience=resolved_audience, minimum_slides=minimum_slides)
@@ -327,6 +361,7 @@ def generate_plan_skill(
             "source_digest": resolved_source_digest,
             "skill_root": skill_root,
             "skill_md_path": skill_md_path,
+            "evidence_path": resolved_source_digest.get("path") if resolved_source_digest else None,
             "grounding_warnings": spec.grounding_warnings,
             "project_memory": {
                 "preferences": project_memory.get("preferences", []),
@@ -473,7 +508,10 @@ def build_ppt_skill(*, session: ShellSession, plan_path: str | None = None, outp
     target = Path(plan_path or session.latest_plan_path or "")
     document = read_plan_document(target)
     out = Path(output_path or (session.output_dir / "shell-deck.pptx"))
-    artifact = build_pptx(document.spec, out)
+    evidence_pack, evidence_path, evidence_warnings = _evidence_from_plan(document, session=session)
+    artifact = build_pptx(document.spec, out, evidence_pack=evidence_pack, evidence_path=evidence_path)
+    visual_report_path = visual_quality_report_path(artifact.path)
+    visual_report = evaluate_pptx_visual_quality(document.spec, artifact.path, report_path=visual_report_path)
     session.latest_ppt_path = str(artifact.path)
     session.last_build_status = "completed"
     session.pending_action = None
@@ -481,9 +519,24 @@ def build_ppt_skill(*, session: ShellSession, plan_path: str | None = None, outp
         session=session,
         event="ppt_built",
         trace_type="accepted_output",
-        payload={"plan_path": str(target), "ppt_path": str(artifact.path)},
+        payload={
+            "plan_path": str(target),
+            "ppt_path": str(artifact.path),
+            "visual_quality_report_path": str(visual_report_path),
+            "visual_quality_score": visual_report.score,
+        },
     )
-    return {"ppt_path": str(artifact.path), "reply": f"Wrote PPTX to {artifact.path}."}
+    result = {
+        "ppt_path": str(artifact.path),
+        "visual_quality_report_path": str(visual_report_path),
+        "visual_quality": visual_report.model_dump(mode="json"),
+    }
+    if evidence_warnings:
+        result["warnings"] = evidence_warnings
+        result["reply"] = f"Wrote PPTX to {artifact.path}. Visual quality score: {visual_report.score}. Evidence warnings: {'; '.join(evidence_warnings)}"
+        return result
+    result["reply"] = f"Wrote PPTX to {artifact.path}. Visual quality score: {visual_report.score}."
+    return result
 
 
 def build_html_deck_skill(
@@ -642,7 +695,7 @@ def _make_appendix_slide(*, topic: str, audience: str, index: int) -> SlideSpec:
 
 
 def _activate_user_skill_context(session: ShellSession, skill_name: str) -> None:
-    if skill_name not in session.enabled_user_skills:
+    if skill_name not in session.available_user_skills or skill_name in session.disabled_user_skills:
         return
     record = next((item for item in session.user_skill_records if item.get("name") == skill_name), None)
     if not record:
@@ -693,3 +746,19 @@ def _artifact_stem(session: ShellSession, spec: PptSpec) -> str:
     if len(selected) == 1:
         return Path(selected[0]).stem
     return spec.title.replace(" ", "-")[:40] or "shell-deck"
+
+
+def _prepare_evidence_pack(session: ShellSession, sources: list[str]):
+    if len(sources) != 1:
+        return None, None, []
+    source = Path(sources[0])
+    return ensure_mineru_evidence_for_source(source, workspace=session.cwd)
+
+
+def _evidence_from_plan(document, *, session: ShellSession):
+    source_digest = document.payload.get("source_digest") or document.spec.source_digest or {}
+    evidence_path = source_digest.get("path") if isinstance(source_digest, dict) else None
+    if not evidence_path:
+        evidence_path = session.latest_evidence_path
+    pack, path, warnings = load_evidence_pack(evidence_path)
+    return pack, path, warnings

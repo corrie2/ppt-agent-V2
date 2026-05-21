@@ -13,6 +13,7 @@ def plan_node(state: dict[str, Any]) -> dict[str, Any]:
         intent,
         provider=state_get(state, "planner_provider"),
         model=state_get(state, "planner_model"),
+        allow_fallback=bool(state_get(state, "allow_fallback", False)),
     )
     return {"spec": spec.model_dump(mode="json"), "transitions": append_transition(state, "plan")}
 

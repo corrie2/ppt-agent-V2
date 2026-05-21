@@ -13,19 +13,24 @@ import httpx
 import typer
 from rich.console import Console
 
-from ppt_agent.domain.evidence import EvidencePack
+from ppt_agent.domain.analysis import PaperAnalysis
+from ppt_agent.domain.evidence import ClaimEvidence, EvidencePack, FigureAsset, SectionEvidence, TableAsset
 from ppt_agent.domain.models import AgentMode, AgentState, DeckIntent, PptSpec
 from ppt_agent.agent.skill_loader import load_user_skill, load_user_skills, project_skill_dir
 from ppt_agent.graph.agent import create_agent_graph
 from ppt_agent.ingest import EvidenceBuilder, MarkdownParser, MinerUAdapter
 from ppt_agent.ingest.mineru_adapter import MinerUOptions
+from ppt_agent.llm.analyzer import generate_paper_analysis_with_llm
 from ppt_agent.llm.planner import PlannerConfigError
 from ppt_agent.llm.providers import PROVIDER_SPECS, validate_model, validate_provider
-from ppt_agent.runtime.document_qa import DocumentQaReport, run_document_qa, write_document_qa_report
+from ppt_agent.runtime.document_qa import DocumentQaReport, run_document_qa, run_pptx_render_qa, write_document_qa_report
 from ppt_agent.runtime.document_repair import repair_plan_spec
-from ppt_agent.runtime.planner import test_planner_connection
+from ppt_agent.runtime.agent_llm import default_agent_llm_config, write_default_agent_llm_config
+from ppt_agent.runtime.plan_polisher import polish_plan_spec
+from ppt_agent.runtime.planner import resolve_planner_selection, test_planner_connection
 from ppt_agent.runtime.pptx import build_pptx
-from ppt_agent.storage.llm_settings import key_statuses, load_selection, save_api_key, save_selection
+from ppt_agent.runtime.visual_quality import evaluate_pptx_visual_quality, visual_quality_report_path
+from ppt_agent.storage.llm_settings import key_statuses, load_api_key, load_selection, save_api_key, save_selection
 from ppt_agent.storage.project_memory import retrieve_failure_patterns, retrieve_project_memory
 from ppt_agent.storage.plan_io import (
     MigratePlanResult,
@@ -41,10 +46,12 @@ from ppt_agent.storage.plan_io import (
 app = typer.Typer(help="PPT Agent CLI")
 llm_app = typer.Typer(help="LLM provider configuration")
 skill_app = typer.Typer(help="User skill management")
+agent_app = typer.Typer(help="Multi-agent configuration")
 console = Console()
 err_console = Console(stderr=True)
 app.add_typer(llm_app, name="llm")
 app.add_typer(skill_app, name="skill")
+app.add_typer(agent_app, name="agent")
 
 
 class IngestParser(str, Enum):
@@ -72,20 +79,29 @@ def plan(
     topic: Annotated[str | None, typer.Argument(help="Presentation topic or goal. Optional when using --evidence.")] = None,
     spec: Annotated[Path, typer.Option("--spec", "-s", help="Where to write the structured spec.")] = Path("deck_spec.json"),
     evidence: Annotated[Path | None, typer.Option("--evidence", help="EvidencePack JSON to ground the generated plan.")] = None,
+    analysis: Annotated[Path | None, typer.Option("--analysis", help="paper_analysis.json to guide the generated plan.")] = None,
     provider: Annotated[str | None, typer.Option("--provider", help="LLM provider override for planning.")] = None,
     model: Annotated[str | None, typer.Option("--model", help="LLM model override for planning.")] = None,
+    allow_fallback: Annotated[bool, typer.Option("--allow-fallback", help="Use deterministic planner when configured LLM key is missing.")] = False,
 ) -> None:
     """Create a structured deck spec without building a PPTX."""
     _validate_llm_override(provider=provider, model=model)
     evidence_pack: EvidencePack | None = None
+    paper_analysis: PaperAnalysis | None = None
     if evidence is not None:
         try:
             evidence_pack = _read_evidence_pack(evidence)
         except ValueError as exc:
             err_console.print(f"[bold red]plan[/bold red]: {exc}")
             raise typer.Exit(code=1) from exc
+    if analysis is not None:
+        try:
+            paper_analysis = PaperAnalysis.model_validate(_read_json_file(analysis, label="paper analysis"))
+        except ValueError as exc:
+            err_console.print(f"[bold red]plan[/bold red]: {exc}")
+            raise typer.Exit(code=1) from exc
 
-    effective_topic = topic or _topic_from_evidence(evidence_pack)
+    effective_topic = topic or (paper_analysis.paper_title if paper_analysis and paper_analysis.paper_title else None) or _topic_from_evidence(evidence_pack)
     if not effective_topic:
         err_console.print("[bold red]plan[/bold red]: topic is required unless --evidence is provided")
         raise typer.Exit(code=2)
@@ -98,14 +114,27 @@ def plan(
         memory = {"preferences": []}
         failures = {"failure_patterns": []}
     evidence_digest = _evidence_digest(evidence_pack, evidence_path=evidence) if evidence_pack is not None else None
+    source_digest = _planning_source_digest(evidence_digest=evidence_digest, paper_analysis=paper_analysis, analysis_path=analysis)
     intent = DeckIntent(
         topic=effective_topic,
         project_preferences=memory.get("preferences", []),
         failure_patterns=failures.get("failure_patterns", []),
-        source_digest=evidence_digest,
+        source_digest=source_digest,
         source_context=(evidence_digest or {}).get("evidence_items", []) if evidence_digest else [],
     )
-    state = AgentState(intent=intent, mode=AgentMode.PLAN, planner_provider=provider, planner_model=model)
+    _print_planner_run_info(
+        evidence_digest=evidence_digest,
+        provider=provider,
+        model=model,
+        allow_fallback=allow_fallback,
+    )
+    state = AgentState(
+        intent=intent,
+        mode=AgentMode.PLAN,
+        planner_provider=provider,
+        planner_model=model,
+        allow_fallback=allow_fallback,
+    )
     result = _invoke_graph_or_exit(graph, state)
     ppt_spec = PptSpec.model_validate(result["spec"])
     write_plan_document(
@@ -118,6 +147,50 @@ def plan(
         metadata=_project_memory_metadata(memory=memory, failures=failures),
     )
     console.print(f"Wrote spec to [bold]{spec}[/bold]")
+    _print_multi_agent_artifacts(ppt_spec)
+
+
+@app.command()
+def analyze(
+    evidence: Annotated[Path, typer.Option("--evidence", help="EvidencePack JSON to analyze.")],
+    analysis: Annotated[Path, typer.Option("--analysis", help="Where to write paper_analysis.json.")],
+    provider: Annotated[str | None, typer.Option("--provider", help="LLM provider override for analysis.")] = None,
+    model: Annotated[str | None, typer.Option("--model", help="LLM model override for analysis.")] = None,
+) -> None:
+    """Analyze a paper EvidencePack into paper_analysis.json without creating slides."""
+    _validate_llm_override(provider=provider, model=model)
+    try:
+        evidence_pack = _read_evidence_pack(evidence)
+    except ValueError as exc:
+        err_console.print(f"[bold red]analyze[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
+    resolved_provider, resolved_model = resolve_planner_selection(provider=provider, model=model)
+    if not resolved_provider or not resolved_model:
+        err_console.print("[bold red]analyze[/bold red]: no provider/model configured. Run `ppt-agent llm configure --provider <provider> --model <model>`.")
+        raise typer.Exit(code=1)
+    api_key = load_api_key(resolved_provider)
+    if not api_key:
+        err_console.print(
+            f"[bold red]analyze[/bold red]: missing API key for provider {resolved_provider}. "
+            f"Run `ppt-agent llm set-key {resolved_provider} --api-key <key>`."
+        )
+        raise typer.Exit(code=1)
+
+    evidence_digest = _evidence_digest(evidence_pack, evidence_path=evidence)
+    try:
+        result = generate_paper_analysis_with_llm(
+            evidence_digest,
+            provider=resolved_provider,
+            model=resolved_model,
+            api_key=api_key,
+        )
+    except (httpx.HTTPError, ValueError) as exc:
+        err_console.print(f"[bold red]analyze[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
+    analysis.parent.mkdir(parents=True, exist_ok=True)
+    analysis.write_text(result.to_json(), encoding="utf-8")
+    console.print(f"Analyzer: llm {resolved_provider}/{resolved_model}")
+    console.print(f"Wrote analysis to [bold]{analysis}[/bold]")
 
 
 @app.command()
@@ -130,6 +203,10 @@ def build(
     ],
     out: Annotated[Path, typer.Option("--out", "-o", help="Output PPTX path.")] = Path("deck.pptx"),
     evidence: Annotated[Path | None, typer.Option("--evidence", help="EvidencePack JSON used to resolve figure_ids.")] = None,
+    debug_source_trace: Annotated[
+        bool,
+        typer.Option("--debug-source-trace", help="Include full Source Trace in speaker notes for debugging."),
+    ] = False,
 ) -> None:
     """Build a PPTX from a unified plan/spec JSON file with schema_version."""
     document = _load_executable_plan(spec, command_name="build")
@@ -141,7 +218,25 @@ def build(
         except ValueError as exc:
             err_console.print(f"[bold red]build[/bold red]: {exc}")
             raise typer.Exit(code=1) from exc
-    result = build_pptx(ppt_spec, out, evidence_pack=evidence_pack, evidence_path=evidence)
+    result = build_pptx(
+        ppt_spec,
+        out,
+        evidence_pack=evidence_pack,
+        evidence_path=evidence,
+        debug_source_trace=debug_source_trace,
+    )
+    render_report = run_pptx_render_qa(
+        ppt_spec,
+        pptx_path=result.path,
+        debug_source_trace=debug_source_trace,
+    )
+    for issue in render_report.issues:
+        console.print(f"Warning: {issue.message}")
+    visual_report_path = visual_quality_report_path(result.path)
+    visual_report = evaluate_pptx_visual_quality(ppt_spec, result.path, report_path=visual_report_path)
+    if not visual_report.ok:
+        console.print(f"Warning: visual quality score {visual_report.score}: {visual_report.summary}")
+    console.print(f"Wrote visual quality report to [bold]{visual_report_path}[/bold]")
     console.print(f"Wrote PPTX to [bold]{result.path}[/bold]")
 
 
@@ -297,6 +392,38 @@ def migrate_plan(
         console.print("Already current schema, normalized output written")
 
 
+@app.command("polish-plan")
+def polish_plan(
+    input_path: Annotated[
+        Path,
+        typer.Argument(help=f"Path to an existing analysis/LLM plan JSON. Schema={PLAN_SCHEMA_VERSION} and legacy plans are supported."),
+    ],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Where to write the presentation-ready plan JSON.")],
+) -> None:
+    """Compress an existing plan into a presentation-ready plan for rendering."""
+    try:
+        document = read_plan_document(input_path)
+        result = polish_plan_spec(document.spec)
+        write_plan_document(
+            out,
+            intent=_intent_from_plan_payload(document.payload, result.spec),
+            spec=result.spec,
+            mode=document.payload.get("mode", "plan"),
+            approved=document.payload.get("approved", False),
+            transitions=[*document.payload.get("transitions", []), "polish_plan"],
+            theme=document.payload.get("theme"),
+        )
+    except ValueError as exc:
+        err_console.print(f"[bold red]polish-plan[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"Input: {input_path}")
+    console.print(f"Output: {out}")
+    console.print(f"Slides Changed: {result.slides_changed}")
+    console.print(f"Bullets Shortened: {result.bullets_shortened}")
+    console.print(f"Notes Extended: {result.notes_extended}")
+
+
 @app.command()
 def run(
     topic: Annotated[str | None, typer.Argument(help="Presentation topic or goal. Optional when using --from-plan.")] = None,
@@ -366,6 +493,8 @@ def run(
         for node_name, update in chunk.items():
             result.update(update)
             if node_name == "plan":
+                if result.get("spec"):
+                    _print_multi_agent_artifacts(PptSpec.model_validate(result["spec"]))
                 if plan_out is not None:
                     _write_plan(plan_out, result)
                     console.print(f"[bold]plan[/bold]: wrote review file to [bold]{plan_out}[/bold]")
@@ -388,6 +517,13 @@ def run(
                 else:
                     console.print("[bold]approve[/bold]: rejected, build skipped")
             elif node_name == "build":
+                console.print("[bold]visual[/bold]: evaluating generated deck quality")
+            elif node_name == "visual_quality":
+                score = (result.get("visual_quality_report") or {}).get("score")
+                if score is not None:
+                    console.print(f"[bold]visual[/bold]: score {score}")
+                if result.get("visual_quality_report_path"):
+                    console.print(f"[bold]visual[/bold]: report {result['visual_quality_report_path']}")
                 console.print("[bold]qa[/bold]: checking generated deck")
             elif node_name == "qa":
                 console.print("[bold]qa[/bold]: complete")
@@ -417,6 +553,15 @@ def _write_run_plan(path: Path, state: dict) -> None:
 
 def _write_plan(path: Path, state: dict) -> None:
     _write_run_plan(path, state)
+
+
+def _print_multi_agent_artifacts(spec: PptSpec) -> None:
+    source = spec.source_digest or {}
+    if source.get("type") != "multi_agent_pipeline":
+        return
+    task_dir = source.get("task_dir")
+    if task_dir:
+        console.print(f"[bold]agents[/bold]: artifacts written to [bold]{task_dir}[/bold]")
 
 
 def _read_json_file(path: Path, *, label: str) -> dict:
@@ -465,6 +610,10 @@ def _topic_from_evidence(pack: EvidencePack | None) -> str | None:
 
 
 def _evidence_digest(pack: EvidencePack, *, evidence_path: Path | None) -> dict:
+    sections = _section_summaries(pack)
+    figures = _figure_summaries(pack)
+    tables = _table_summaries(pack)
+    claims = _claim_summaries(pack)
     return {
         "type": "evidence_pack",
         "path": str(evidence_path) if evidence_path else None,
@@ -477,71 +626,271 @@ def _evidence_digest(pack: EvidencePack, *, evidence_path: Path | None) -> dict:
             }
             for source in pack.source_files
         ],
-        "evidence_items": [
-            *_section_summaries(pack),
-            *_figure_summaries(pack),
-            *_table_summaries(pack),
-            *_claim_summaries(pack),
-        ],
+        "selection_summary": {
+            "sections_total": len(pack.sections),
+            "figures_total": len(pack.figures),
+            "tables_total": len(pack.tables),
+            "claims_total": len(pack.claims),
+            "sections_selected": len(sections),
+            "figures_selected": len(figures),
+            "tables_selected": len(tables),
+            "claims_selected": len(claims),
+            "missing_roles": _missing_section_roles(sections),
+        },
+        "evidence_items": [*sections, *figures, *tables, *claims],
     }
 
 
+def _planning_source_digest(
+    *,
+    evidence_digest: dict | None,
+    paper_analysis: PaperAnalysis | None,
+    analysis_path: Path | None,
+) -> dict | None:
+    if evidence_digest is None and paper_analysis is None:
+        return None
+    if paper_analysis is None:
+        return evidence_digest
+    payload = {
+        "type": "paper_analysis",
+        "analysis_path": str(analysis_path) if analysis_path else None,
+        "paper_analysis": paper_analysis.model_dump(mode="json"),
+    }
+    if evidence_digest is not None:
+        payload["evidence_digest"] = evidence_digest
+        payload["type"] = "paper_analysis_with_evidence"
+    return payload
+
+
 def _section_summaries(pack: EvidencePack) -> list[dict]:
+    selected = _select_sections(pack.sections)
     return [
         {
             "type": "section",
+            "role": role,
             "evidence_id": section.id,
             "source_file": section.source_file,
             "page": section.page,
             "heading": section.heading,
-            "text": _truncate(section.text),
+            "text": _truncate(section.text, limit=1000),
+            "why_selected": why,
+            "score": round(score, 3),
         }
-        for section in pack.sections[:24]
+        for section, role, why, score in selected
     ]
 
 
 def _figure_summaries(pack: EvidencePack) -> list[dict]:
+    selected = _select_figures(pack.figures)
     return [
         {
             "type": "figure",
+            "role": role,
             "evidence_id": figure.id,
             "source_file": figure.source_file,
             "page": figure.page,
             "caption": figure.caption,
-            "text": _truncate(figure.text or ""),
+            "text": _truncate(figure.text or "", limit=700),
             "path": figure.path,
+            "why_selected": why,
+            "score": round(score, 3),
         }
-        for figure in pack.figures[:12]
+        for figure, role, why, score in selected
     ]
 
 
 def _table_summaries(pack: EvidencePack) -> list[dict]:
+    selected = _select_tables(pack.tables)
     return [
         {
             "type": "table",
+            "role": role,
             "evidence_id": table.id,
             "source_file": table.source_file,
             "page": table.page,
             "caption": table.caption,
-            "text": _truncate(table.text or ""),
+            "text": _truncate(table.text or "", limit=700),
+            "why_selected": why,
+            "score": round(score, 3),
         }
-        for table in pack.tables[:12]
+        for table, role, why, score in selected
     ]
 
 
 def _claim_summaries(pack: EvidencePack) -> list[dict]:
+    selected = _select_claims(pack.claims)
     return [
         {
             "type": "claim",
+            "role": role,
             "evidence_id": claim.id,
             "source_file": claim.source_file,
             "page": claim.page,
-            "text": _truncate(claim.text),
+            "text": _truncate(claim.text, limit=500),
             "supporting_evidence_ids": claim.supporting_evidence_ids,
             "confidence": claim.confidence,
+            "why_selected": why,
+            "score": round(score, 3),
         }
-        for claim in pack.claims[:24]
+        for claim, role, why, score in selected
     ]
+
+
+SECTION_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "abstract": ("abstract", "summary"),
+    "introduction": ("introduction", "intro"),
+    "problem_or_motivation": ("problem", "motivation", "challenge", "background"),
+    "method_or_approach": ("method", "approach", "architecture", "framework", "algorithm", "system", "pipeline"),
+    "experiment_or_evaluation": ("experiment", "evaluation", "setup", "dataset", "baseline", "metric"),
+    "results": ("result", "performance", "comparison", "benchmark", "outperform"),
+    "ablation_or_analysis": ("ablation", "analysis", "sensitivity", "case study", "discussion"),
+    "conclusion_or_limitations": ("conclusion", "limitation", "future work", "takeaway"),
+}
+
+FIGURE_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "method_overview": ("framework", "architecture", "pipeline", "overview", "workflow"),
+    "algorithm_or_component": ("algorithm", "module", "component"),
+    "result": ("result", "performance", "comparison", "benchmark"),
+    "analysis_or_ablation": ("ablation", "sensitivity", "analysis", "case study"),
+}
+
+TABLE_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "main_results": ("result", "performance", "comparison", "benchmark", "score"),
+    "ablation": ("ablation", "variant", "sensitivity", "component"),
+    "dataset_or_setup": ("dataset", "setup", "baseline", "metric", "statistics"),
+}
+
+
+def _select_sections(sections: list[SectionEvidence], *, max_items: int = 36) -> list[tuple[SectionEvidence, str, str, float]]:
+    selected: dict[str, tuple[SectionEvidence, str, str, float]] = {}
+    used_ids: set[str] = set()
+    scored = [_score_section(section) for section in sections]
+
+    for role in SECTION_ROLE_KEYWORDS:
+        candidates = [item for item in scored if item[1] == role and item[0].id not in used_ids]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda item: (item[3], _text_density(item[0].text)))
+        selected[best[0].id] = best
+        used_ids.add(best[0].id)
+
+    remaining = [item for item in scored if item[0].id not in used_ids]
+    remaining.sort(key=lambda item: (item[3], _text_density(item[0].text)), reverse=True)
+    for item in remaining:
+        if len(selected) >= max_items:
+            break
+        if item[3] <= 0 and len(selected) >= min(max_items, 12):
+            break
+        selected[item[0].id] = item
+    return list(selected.values())
+
+
+def _score_section(section: SectionEvidence) -> tuple[SectionEvidence, str, str, float]:
+    heading = section.heading or ""
+    sample = f"{heading} {section.text[:500]}".lower()
+    best_role = "high_information"
+    best_hits = 0
+    for role, keywords in SECTION_ROLE_KEYWORDS.items():
+        hits = sum(1 for keyword in keywords if keyword in sample)
+        if hits > best_hits:
+            best_role = role
+            best_hits = hits
+    density = min(_text_density(section.text) / 1200, 0.25)
+    score = min(1.0, 0.45 + best_hits * 0.18 + density) if best_hits else min(0.5, 0.2 + density)
+    why = f"heading/text matched {best_role} keywords" if best_hits else "high information density section"
+    return section, best_role, why, score
+
+
+def _select_figures(figures: list[FigureAsset], *, max_items: int = 12) -> list[tuple[FigureAsset, str, str, float]]:
+    scored = [_score_visual(figure, FIGURE_ROLE_KEYWORDS, fallback_role="supporting_figure") for figure in figures]
+    return _pick_by_role_then_score(scored, max_items=max_items)
+
+
+def _select_tables(tables: list[TableAsset], *, max_items: int = 12) -> list[tuple[TableAsset, str, str, float]]:
+    scored = [_score_visual(table, TABLE_ROLE_KEYWORDS, fallback_role="supporting_table") for table in tables]
+    if len(scored) <= max_items:
+        return scored
+    return _pick_by_role_then_score(scored, max_items=max_items)
+
+
+def _select_claims(claims: list[ClaimEvidence], *, max_items: int = 24) -> list[tuple[ClaimEvidence, str, str, float]]:
+    scored: list[tuple[ClaimEvidence, str, str, float]] = []
+    for claim in claims:
+        text = claim.text.lower()
+        role = "claim"
+        if any(token in text for token in ("result", "outperform", "improve", "performance")):
+            role = "result_claim"
+        elif any(token in text for token in ("method", "approach", "propose", "framework")):
+            role = "method_claim"
+        confidence = claim.confidence if claim.confidence is not None else 0.5
+        support_bonus = min(len(claim.supporting_evidence_ids) * 0.08, 0.24)
+        scored.append((claim, role, "claim confidence and supporting evidence ranking", min(1.0, confidence + support_bonus)))
+    return sorted(scored, key=lambda item: item[3], reverse=True)[:max_items]
+
+
+def _score_visual(item: FigureAsset | TableAsset, role_keywords: dict[str, tuple[str, ...]], *, fallback_role: str) -> tuple:
+    haystack = f"{item.caption or ''} {getattr(item, 'text', '') or ''}".lower()
+    best_role = fallback_role
+    best_hits = 0
+    for role, keywords in role_keywords.items():
+        hits = sum(1 for keyword in keywords if keyword in haystack)
+        if hits > best_hits:
+            best_role = role
+            best_hits = hits
+    score = min(1.0, 0.35 + best_hits * 0.2 + min(len(haystack) / 1400, 0.2)) if best_hits else 0.3
+    why = f"caption/text matched {best_role} keywords" if best_hits else "included as supporting visual evidence"
+    return item, best_role, why, score
+
+
+def _pick_by_role_then_score(scored: list[tuple], *, max_items: int) -> list[tuple]:
+    selected: dict[str, tuple] = {}
+    for role in dict.fromkeys(item[1] for item in scored):
+        candidates = [item for item in scored if item[1] == role]
+        if candidates:
+            best = max(candidates, key=lambda item: item[3])
+            selected[best[0].id] = best
+    for item in sorted(scored, key=lambda item: item[3], reverse=True):
+        if len(selected) >= max_items:
+            break
+        selected.setdefault(item[0].id, item)
+    return list(selected.values())
+
+
+def _missing_section_roles(sections: list[dict]) -> list[str]:
+    selected_roles = {section.get("role") for section in sections}
+    return [role for role in SECTION_ROLE_KEYWORDS if role not in selected_roles]
+
+
+def _text_density(text: str) -> int:
+    return len({token.strip(".,:;()[]{}").lower() for token in text.split() if len(token.strip(".,:;()[]{}")) > 3})
+
+
+def _print_planner_run_info(
+    *,
+    evidence_digest: dict | None,
+    provider: str | None,
+    model: str | None,
+    allow_fallback: bool,
+) -> None:
+    resolved_provider, resolved_model = resolve_planner_selection(provider=provider, model=model)
+    if resolved_provider and resolved_model and load_api_key(resolved_provider):
+        console.print(f"Planner: llm {resolved_provider}/{resolved_model}")
+    elif resolved_provider and resolved_model and allow_fallback:
+        console.print("Planner: multi-agent pipeline fallback")
+    elif resolved_provider and resolved_model:
+        console.print(f"Planner: llm {resolved_provider}/{resolved_model} (missing key)")
+    else:
+        console.print("Planner: multi-agent pipeline")
+    if evidence_digest:
+        summary = evidence_digest.get("selection_summary") or {}
+        console.print(
+            "Evidence: "
+            f"items={len(evidence_digest.get('evidence_items') or [])}, "
+            f"sections={summary.get('sections_selected', 0)}/{summary.get('sections_total', 0)}, "
+            f"figures={summary.get('figures_selected', 0)}/{summary.get('figures_total', 0)}, "
+            f"tables={summary.get('tables_selected', 0)}/{summary.get('tables_total', 0)}, "
+            f"claims={summary.get('claims_selected', 0)}/{summary.get('claims_total', 0)}"
+        )
 
 
 def _truncate(value: str, *, limit: int = 360) -> str:
@@ -678,8 +1027,18 @@ def list_providers() -> None:
 def configure_llm(
     provider: Annotated[str, typer.Option("--provider", help="Provider name.")],
     model: Annotated[str, typer.Option("--model", help="Model name for the provider.")],
+    ask_deepseek_pro: Annotated[
+        bool,
+        typer.Option(
+            "--ask-deepseek-pro",
+            help="When configuring deepseek-v4-flash, ask whether to use deepseek-v4-pro instead.",
+        ),
+    ] = False,
 ) -> None:
     """Persist the default provider and model selection."""
+    if ask_deepseek_pro and provider == "deepseek" and model == "deepseek-v4-flash":
+        if typer.confirm("Use deepseek-v4-pro instead of deepseek-v4-flash?", default=False):
+            model = "deepseek-v4-pro"
     selection = save_selection(provider, model)
     console.print(f"Saved default planner: {selection.provider} / {selection.model}")
 
@@ -838,6 +1197,26 @@ def skill_validate(path_or_name: Annotated[str, typer.Argument(help="Skill path 
     console.print("Validation OK")
 
 
+@agent_app.command("init-config")
+def agent_init_config(
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing agent config.")] = False,
+) -> None:
+    """Write the default multi-agent model routing config."""
+    path = Path.cwd() / ".ppt-agent" / "agents" / "config.json"
+    if path.exists() and not force:
+        console.print(f"Agent config already exists at [bold]{path}[/bold]")
+        console.print("Use --force to overwrite it.")
+        return
+    path = write_default_agent_llm_config(Path.cwd())
+    console.print(f"Wrote agent config to [bold]{path}[/bold]")
+
+
+@agent_app.command("show-config")
+def agent_show_config() -> None:
+    """Show the default multi-agent model routing config."""
+    console.print(default_agent_llm_config().model_dump_json(indent=2))
+
+
 def _looks_like_git_url(value: str) -> bool:
     lowered = value.lower()
     return lowered.startswith("http://") or lowered.startswith("https://") or lowered.endswith(".git")
@@ -866,6 +1245,22 @@ def test_llm(
     console.print(f"Model: {result.model}")
     console.print(f"Key Status: {result.key_status}")
     console.print(f"Connection OK: {'yes' if result.connection_ok else 'no'}")
+
+
+@app.command("serve")
+def serve(
+    host: Annotated[str, typer.Option("--host", help="Host interface for the web server.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port for the web server.")] = 7860,
+    reload: Annotated[bool, typer.Option("--reload", help="Reload server when source files change.")] = False,
+) -> None:
+    """Start the PPT Agent Studio web UI."""
+    try:
+        import uvicorn
+    except ImportError as exc:
+        err_console.print("[bold red]serve[/bold red]: missing uvicorn. Install the web dependencies first.")
+        raise typer.Exit(code=1) from exc
+    console.print(f"PPT Agent Studio: http://{host}:{port}")
+    uvicorn.run("ppt_agent.server.app:app", host=host, port=port, reload=reload)
 
 
 def _validate_llm_override(*, provider: str | None, model: str | None) -> None:

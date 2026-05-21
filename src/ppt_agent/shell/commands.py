@@ -124,6 +124,7 @@ def is_build_status_query(text: str) -> bool:
         return True
     chinese_markers = (
         "\u505a\u597d\u4e86\u5417",
+        "\u5236\u4f5c\u597d\u4e86\u5417",
         "\u751f\u6210\u597d\u4e86\u5417",
         "\u5b8c\u6210\u4e86\u5417",
         "ppt\u505a\u597d\u4e86\u5417",
@@ -297,8 +298,14 @@ def is_approval_utterance(text: str) -> bool:
         "\u786e\u8ba4",
         "\u53ef\u4ee5",
         "\u5f00\u59cb",
+        "\u5236\u4f5c",
+        "\u5f00\u59cb\u505a",
+        "\u5f00\u59cb\u5236\u4f5c",
         "\u5f00\u59cb\u751f\u6210",
         "\u751f\u6210",
+        "\u5236\u4f5c\u597d\u4e86\u544a\u8bc9\u6211",
+        "\u5236\u4f5c\u597d\u544a\u8bc9\u6211",
+        "\u505a\u597d\u4e86\u544a\u8bc9\u6211",
         "\u6267\u884c",
         "yes",
         "y",
@@ -384,6 +391,9 @@ def handle_command(raw: str, *, session: ShellSession, registry, output_fn) -> b
             output_fn(f"model: {session.assistant_model or 'none'}")
             output_fn(f"key configured: {'yes' if session.assistant_key_configured() else 'no'}")
         output_fn(f"latest plan: {session.latest_plan_path or 'none'}")
+        output_fn(f"latest evidence: {session.latest_evidence_path or 'none'}")
+        if session.latest_evidence_warnings:
+            output_fn("latest evidence warnings: " + "; ".join(session.latest_evidence_warnings))
         if session.latest_plan_sources:
             output_fn(f"latest plan sources: {', '.join(Path(path).name for path in session.latest_plan_sources)}")
         output_fn(f"latest ppt: {session.latest_ppt_path or 'none'}")
@@ -394,6 +404,10 @@ def handle_command(raw: str, *, session: ShellSession, registry, output_fn) -> b
             "enabled user skills: "
             + (", ".join(session.enabled_user_skills) if session.enabled_user_skills else "none")
         )
+        output_fn(
+            "disabled user skills: "
+            + (", ".join(session.disabled_user_skills) if session.disabled_user_skills else "none")
+        )
         draft = session.draft_request
         output_fn(f"draft requested pdf: {draft.requested_pdf_name or 'none'}")
         output_fn(f"draft topic: {draft.topic or 'none'}")
@@ -401,6 +415,7 @@ def handle_command(raw: str, *, session: ShellSession, registry, output_fn) -> b
         output_fn(f"draft min slides: {draft.min_slides or 'none'}")
         output_fn(f"draft slide count: {draft.slide_count or 'none'}")
         output_fn(f"draft output format: {draft.output_format or 'none'}")
+        output_fn(f"draft output name: {draft.output_name or 'none'}")
         output_fn(f"draft applied skills: {', '.join(draft.applied_skills) if draft.applied_skills else 'none'}")
         output_fn(
             "draft selected pdfs: "
@@ -483,7 +498,7 @@ def handle_command(raw: str, *, session: ShellSession, registry, output_fn) -> b
                 arguments={
                     "plan_path": session.latest_plan_path,
                     "skill_name": "guizang-ppt-skill",
-                    "output_path": str(session.output_dir / "shell-deck.html"),
+                    "output_path": str(session.output_dir / _requested_output_filename(session, suffix=".html")),
                     "theme": plan.payload.get("theme") or "magazine",
                 },
                 description="build current HTML deck from latest plan",
@@ -491,7 +506,10 @@ def handle_command(raw: str, *, session: ShellSession, registry, output_fn) -> b
         else:
             session.pending_action = PendingAction(
                 skill_name="build_ppt",
-                arguments={"plan_path": session.latest_plan_path, "output_path": str(session.output_dir / "shell-deck.pptx")},
+                arguments={
+                    "plan_path": session.latest_plan_path,
+                    "output_path": str(session.output_dir / _requested_output_filename(session, suffix=".pptx")),
+                },
                 description="build current PPT from latest plan",
             )
         session.last_build_status = "pending_approval"
@@ -548,9 +566,14 @@ def _handle_skills_command(argument: str, *, session: ShellSession, registry, ou
             output_fn(f"Warning: {warning}")
         return True
     if action == "selected":
+        session.enabled_user_skills = [name for name in session.available_user_skills if name not in session.disabled_user_skills]
         output_fn(
             "enabled user skills: "
             + (", ".join(session.enabled_user_skills) if session.enabled_user_skills else "none")
+        )
+        output_fn(
+            "disabled user skills: "
+            + (", ".join(session.disabled_user_skills) if session.disabled_user_skills else "none")
         )
         return True
     if action in {"enable", "disable"} and detail:
@@ -558,14 +581,20 @@ def _handle_skills_command(argument: str, *, session: ShellSession, registry, ou
             output_fn(f"Unknown user skill: {detail}")
             return True
         if action == "enable":
-            if detail not in session.enabled_user_skills:
-                session.enabled_user_skills.append(detail)
+            session.disabled_user_skills = [name for name in session.disabled_user_skills if name != detail]
+            session.enabled_user_skills = [name for name in session.available_user_skills if name not in session.disabled_user_skills]
             output_fn(f"Enabled user skills: {', '.join(session.enabled_user_skills)}")
         else:
-            session.enabled_user_skills = [name for name in session.enabled_user_skills if name != detail]
+            if detail not in session.disabled_user_skills:
+                session.disabled_user_skills.append(detail)
+            session.enabled_user_skills = [name for name in session.available_user_skills if name not in session.disabled_user_skills]
             output_fn(
                 "enabled user skills: "
                 + (", ".join(session.enabled_user_skills) if session.enabled_user_skills else "none")
+            )
+            output_fn(
+                "disabled user skills: "
+                + (", ".join(session.disabled_user_skills) if session.disabled_user_skills else "none")
             )
         return True
     if action == "list":
@@ -645,3 +674,13 @@ def _skill_records(session: ShellSession, registry) -> list[dict]:
 
 def _contains_cjk(text: str) -> bool:
     return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _requested_output_filename(session: ShellSession, *, suffix: str) -> str:
+    requested = (session.draft_request.output_name or "").strip()
+    if not requested:
+        return f"shell-deck{suffix}"
+    name = Path(requested).name
+    if not Path(name).suffix:
+        name = f"{name}{suffix}"
+    return name

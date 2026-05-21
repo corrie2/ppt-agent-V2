@@ -21,3 +21,4 @@ class UserSkillManifest(BaseModel):
     effort: str | None = None
     claude_compatible: bool = False
     allowed_tools: list[str] = Field(default_factory=list)
+    agent_scope: list[str] = Field(default_factory=list)

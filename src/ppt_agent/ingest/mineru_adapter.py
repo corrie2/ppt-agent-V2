@@ -20,6 +20,7 @@ class MinerUOptions:
     formula: bool | None = None
     table: bool | None = None
     image_analysis: bool | None = None
+    timeout_seconds: int | None = None
 
 
 class MinerUAdapter:
@@ -39,13 +40,23 @@ class MinerUAdapter:
         output_dir.mkdir(parents=True, exist_ok=True)
         command = _build_mineru_command(input_path=input_path, output_dir=output_dir, options=self.options)
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.options.timeout_seconds,
+            )
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or "").strip()
             message = f"MinerU failed with exit code {exc.returncode}"
             if detail:
                 message = f"{message}: {detail}"
             raise RuntimeError(message) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"MinerU timed out after {self.options.timeout_seconds} seconds") from exc
 
 
 def _build_mineru_command(*, input_path: Path, output_dir: Path, options: MinerUOptions) -> list[str]:

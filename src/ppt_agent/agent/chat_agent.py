@@ -70,7 +70,7 @@ class ChatAgent:
             "messages": [
                 {
                     "role": "system",
-                    "content": self._system_prompt(registry, enabled_user_skills=session.enabled_user_skills),
+                    "content": self._system_prompt(registry, disabled_user_skills=session.disabled_user_skills),
                 },
                 {
                     "role": "user",
@@ -90,6 +90,7 @@ class ChatAgent:
                                 "tone": session.draft_request.tone,
                                 "min_slides": session.draft_request.min_slides,
                                 "slide_count": session.draft_request.slide_count,
+                                "output_name": session.draft_request.output_name,
                                 "selected_sources": session.draft_request.selected_sources,
                             },
                             "discovered_sources": session.discovered_sources[:8],
@@ -147,6 +148,7 @@ class ChatAgent:
                     min_slides=self._extract_min_slide_count(message),
                     audience=self._extract_audience(message),
                     tone=self._extract_tone(message),
+                    output_name=self._extract_output_name(message),
                 )
                 skill_calls.append(SkillCall(name="scan_workspace", arguments={"max_depth": 3}))
                 reply = "I will scan the input directory first and check which PDFs are available."
@@ -168,6 +170,7 @@ class ChatAgent:
                             "min_slides": self._extract_min_slide_count(message),
                             "audience": self._extract_audience(message),
                             "tone": self._extract_tone(message),
+                            "output_name": self._extract_output_name(message),
                             "sources": selected or [item["path"] for item in pdfs],
                         },
                     )
@@ -196,16 +199,25 @@ class ChatAgent:
             raise ValueError("router response did not contain JSON")
         return json.loads(text[start : end + 1])
 
-    def _available_skills(self, registry: SkillRegistry | None, *, enabled_user_skills: list[str] | None = None) -> list[dict[str, Any]]:
+    def _available_skills(
+        self,
+        registry: SkillRegistry | None,
+        *,
+        enabled_user_skills: list[str] | None = None,
+        disabled_user_skills: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         if registry is None:
             return [{"name": name} for name in self._default_skill_names()]
         descriptions: list[dict[str, Any]] = []
         budget = 8000
         used = 0
         enabled = set(enabled_user_skills or [])
+        disabled = set(disabled_user_skills or [])
         filter_user_skills = enabled_user_skills is not None
         for skill in sorted(registry.describe(), key=lambda item: item["name"]):
             if filter_user_skills and skill.get("source") != "built-in" and skill["name"] not in enabled:
+                continue
+            if skill.get("source") != "built-in" and skill["name"] in disabled:
                 continue
             summary = {
                 "name": skill["name"],
@@ -226,12 +238,18 @@ class ChatAgent:
     def _truncate(self, value: str, limit: int) -> str:
         return value if len(value) <= limit else value[: limit - 3] + "..."
 
-    def _system_prompt(self, registry: SkillRegistry | None, *, enabled_user_skills: list[str] | None = None) -> str:
+    def _system_prompt(
+        self,
+        registry: SkillRegistry | None,
+        *,
+        enabled_user_skills: list[str] | None = None,
+        disabled_user_skills: list[str] | None = None,
+    ) -> str:
         sections = {
             "identity": "You are an orchestration agent for a PPT shell.",
             "behavior": "Return JSON only with keys: reply, skill_calls. Each skill_call must have name and arguments.",
             "tool_policy": (
-                f"Available skills: {json.dumps(self._available_skills(registry, enabled_user_skills=enabled_user_skills), ensure_ascii=False)}. "
+                f"Available skills: {json.dumps(self._available_skills(registry, enabled_user_skills=enabled_user_skills, disabled_user_skills=disabled_user_skills), ensure_ascii=False)}. "
                 "Fail closed on unknown tools or invalid arguments."
             ),
             "state_context": "The shell provides cwd, input/output dirs, sources, draft_request, latest artifacts, pending_action, provider and model.",
@@ -339,6 +357,20 @@ class ChatAgent:
             match = re.search(pattern, message, flags=re.IGNORECASE)
             if match:
                 return match.group(1).strip()
+        return None
+
+    def _extract_output_name(self, message: str) -> str | None:
+        for pattern in (
+            r"\u8f93\u51fa\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|\u662f)?\s*([A-Za-z0-9_.-]+)",
+            r"\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|\u662f)?\s*([A-Za-z0-9_.-]+)",
+            r"\u8f93\u51fa(?:\u5230|\u4e3a|\u53eb)?\s*([A-Za-z0-9_.-]+)",
+            r"output(?:\s+file(?:\s+name)?)?\s*(?:is|as|to|called)?\s*([A-Za-z0-9_.-]+)",
+        ):
+            match = re.search(pattern, message, flags=re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip().strip(".")
+                if candidate.lower() not in {"ppt", "pptx", "pdf", "html", "file", "deck"}:
+                    return candidate
         return None
 
     def _extract_topic(self, message: str) -> str:

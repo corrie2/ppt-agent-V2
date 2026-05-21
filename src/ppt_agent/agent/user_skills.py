@@ -16,13 +16,14 @@ class UserSkillInput(BaseModel):
 def reload_user_skills(registry: SkillRegistry, *, session: ShellSession) -> list[str]:
     loaded = load_user_skills(session.cwd)
     session.user_skill_records = [_record(skill) for skill in loaded]
-    previous_enabled = set(session.enabled_user_skills)
     session.available_user_skills = [skill.name for skill in loaded if skill.enabled and skill.manifest]
-    session.enabled_user_skills = [name for name in session.enabled_user_skills if name in session.available_user_skills]
+    previous_disabled = set(session.disabled_user_skills)
+    session.disabled_user_skills = [name for name in session.disabled_user_skills if name in session.available_user_skills]
+    session.enabled_user_skills = [name for name in session.available_user_skills if name not in session.disabled_user_skills]
     warnings: list[str] = []
-    removed = sorted(previous_enabled - set(session.enabled_user_skills))
+    removed = sorted(previous_disabled - set(session.disabled_user_skills))
     if removed:
-        warnings.append(f"Disabled missing user skills: {', '.join(removed)}.")
+        warnings.append(f"Removed missing disabled user skills: {', '.join(removed)}.")
     registered_names = set(registry.names())
     seen_user_names: set[str] = set()
 

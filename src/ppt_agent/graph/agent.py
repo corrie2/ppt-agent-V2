@@ -12,6 +12,7 @@ from ppt_agent.nodes.build import build_node
 from ppt_agent.nodes.plan import plan_node
 from ppt_agent.nodes.qa import qa_node
 from ppt_agent.nodes.repair import repair_node
+from ppt_agent.nodes.visual_quality import visual_quality_node
 from ppt_agent.utils.state import state_get
 
 
@@ -48,6 +49,7 @@ def create_agent_graph(entry_point: str = "plan"):
     graph.add_node("asset_resolve", asset_resolve_node)
     graph.add_node("approve", approve_node)
     graph.add_node("build", build_node)
+    graph.add_node("visual_quality", visual_quality_node)
     graph.add_node("qa", qa_node)
     graph.add_node("repair", repair_node)
 
@@ -56,7 +58,8 @@ def create_agent_graph(entry_point: str = "plan"):
     graph.add_edge("asset_plan", "asset_resolve")
     graph.add_conditional_edges("asset_resolve", _after_asset_resolve, {"approve": "approve", END: END})
     graph.add_conditional_edges("approve", _after_approve, {"build": "build", END: END})
-    graph.add_edge("build", "qa")
+    graph.add_edge("build", "visual_quality")
+    graph.add_edge("visual_quality", "qa")
     graph.add_conditional_edges("qa", _after_qa, {"repair": "repair", END: END})
     graph.add_edge("repair", "build")
     return graph.compile()

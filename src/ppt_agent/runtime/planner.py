@@ -2,6 +2,7 @@
 
 from ppt_agent.domain.models import DeckIntent, PptSpec, SlideSpec
 from ppt_agent.llm.planner import LlmConnectionResult, PlannerConfigError, generate_plan_with_llm, test_llm_connection
+from ppt_agent.runtime.multi_agent_pipeline import build_multi_agent_plan_spec
 from ppt_agent.storage.llm_settings import load_api_key, load_selection
 
 
@@ -10,18 +11,23 @@ def build_plan_spec(
     *,
     provider: str | None = None,
     model: str | None = None,
+    allow_fallback: bool = False,
 ) -> PptSpec:
-    if intent.source_digest and intent.source_digest.get("type") == "evidence_pack" and provider is None and model is None:
-        return deterministic_plan_spec(intent)
-
-    resolved_provider, resolved_model = resolve_planner_selection(provider=provider, model=model)
+    if allow_fallback and not provider and not model:
+        resolved_provider, resolved_model = None, None
+    else:
+        resolved_provider, resolved_model = resolve_planner_selection(provider=provider, model=model)
     if not resolved_provider or not resolved_model:
-        return deterministic_plan_spec(intent)
+        if intent.source_digest:
+            return deterministic_plan_spec(intent)
+        return build_multi_agent_plan_spec(intent).spec
 
     api_key = load_api_key(resolved_provider)
     if not api_key:
-        if intent.source_digest:
-            return deterministic_plan_spec(intent)
+        if allow_fallback:
+            if intent.source_digest:
+                return deterministic_plan_spec(intent)
+            return build_multi_agent_plan_spec(intent).spec
         raise PlannerConfigError(
             f"missing API key for provider {resolved_provider}. Run `ppt-agent llm set-key {resolved_provider} --api-key <key>`."
         )
@@ -38,10 +44,16 @@ def resolve_planner_selection(*, provider: str | None, model: str | None) -> tup
         return provider, model
 
     saved = load_selection()
-    if provider and not model and saved and saved.provider == provider:
-        return provider, saved.model
-    if saved and not provider and not model:
-        return saved.provider, saved.model
+    if isinstance(saved, tuple):
+        saved_provider, saved_model = saved
+    elif saved is not None:
+        saved_provider, saved_model = saved.provider, saved.model
+    else:
+        saved_provider, saved_model = None, None
+    if provider and not model and saved_provider == provider:
+        return provider, saved_model
+    if saved_provider and saved_model and not provider and not model:
+        return saved_provider, saved_model
     return provider, model
 
 

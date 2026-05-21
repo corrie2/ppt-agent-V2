@@ -5,7 +5,7 @@ from ppt_agent.domain.models import PptSpec, SlideSpec
 from ppt_agent.runtime.document_qa import DocumentQaReport
 
 
-MAX_BULLETS = 5
+MAX_BULLETS = 3
 
 
 def repair_plan_spec(

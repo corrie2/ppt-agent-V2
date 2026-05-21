@@ -33,12 +33,14 @@ def generate_plan_with_llm(intent: DeckIntent, *, provider: str, model: str, api
             {
                 "role": "system",
                 "content": (
-                    "You are a planning agent for PowerPoint generation. "
+                    "You are creating a technical paper explanation deck, not a generic business deck. "
                     "Return JSON only. The JSON must match this schema: "
                     '{"schema_version": 2, "title": string, "audience": string, "goal": string, '
                     '"narrative": string, "theme": string, '
                     '"slides": [{"id": string, "role": string, "title": string, "message": string, "layout": string, '
-                    '"content": {"bullets": [string], "figure_ids": [string], "table_ids": [string], "metrics": [object]}, '
+                    '"content": {"bullets": [string], "figure_ids": [string], "table_ids": [string], "metrics": [object], '
+                    '"visual_reason": string, "callouts": [object], "result_summary": [object], '
+                    '"grounding_status": "grounded|partial|needs_verification"}, '
                     '"citations": [{"evidence_id": string, "page": integer|null, "source_file": string|null}], '
                     '"quality_checks": [string], "objective": string, "core_message": string, '
                     '"bullets": [string], "supporting_points": [string], "speaker_notes": string, '
@@ -46,10 +48,14 @@ def generate_plan_with_llm(intent: DeckIntent, *, provider: str, model: str, api
                     '"image_caption": string, "image_rationale": string, "layout_hint": string, '
                     '"style_tags": [string], "evidence_refs": [string], '
                     '"grounding_status": "grounded|partial|ungrounded", "source_notes": string}]}. '
+                    "Target 7 to 10 slides unless evidence is too limited. Every slide must teach one specific idea from the paper. "
+                    "Use the paper's actual story, not a fixed template. Each slide needs one concrete message and at most 3 bullets. "
                     "Do not use generic placeholders like 'Context and objective' or 'Primary recommendation'. "
                     "If source_digest or source_context is provided, generate only facts grounded in those materials. "
-                    "When source_digest.type is evidence_pack, every slide must include role, message, layout, and citations whenever an evidence_id supports the slide. "
-                    "Key conclusions must cite existing evidence_id values only. Figure slides must use layout 'figure_with_caption' and include existing figure evidence_id values in content.figure_ids. "
+                    "If source_digest contains paper_analysis, use it first to form the narrative, then use evidence_digest/evidence_items for grounding. "
+                    "When source_digest.type is evidence_pack, every non-cover slide must include role, message, layout, and non-empty citations. "
+                    "Key conclusions must cite existing evidence_id values only. Figure/table selection must be based on role and relevance; do not default to the first figure. "
+                    "If a slide uses a figure or table, explain the visual choice in content.visual_reason or speaker_notes. "
                     "Never invent evidence IDs, figure IDs, table IDs, metrics, or facts that are absent from the provided evidence_items. "
                     "Do not invent conference names, citation counts, ROI, customer cases, GitHub stars, business deployment metrics, "
                     "or experimental metrics. If evidence does not provide a detail, write 'not provided by source' or omit it. "
@@ -72,13 +78,18 @@ def generate_plan_with_llm(intent: DeckIntent, *, provider: str, model: str, api
                     f"active_skill_context: {intent.active_skill_context or 'none'}\n"
                     "Requirements:\n"
                     "- For academic/paper explanation decks, use a research-paper teaching structure rather than a business proposal.\n"
-                    "- Every slide must have a specific objective and core_message.\n"
+                    "- If paper_analysis is present, prioritize its problem, core_idea, method, experiments, limitations, and recommended_deck_outline.\n"
+                    "- Build a 7 to 10 slide technical paper explanation deck when evidence supports it.\n"
+                    "- Every slide must have a specific objective, one message, and core_message.\n"
                     "- Every slide must have role, message, and layout; mirror message into core_message and layout into layout_hint.\n"
-                    "- At least two slides should use non-image visuals such as timeline, comparison, or card summary.\n"
+                    "- Use at most 3 bullets per slide.\n"
+                    "- At least two slides should use non-image visuals such as timeline, comparison, card summary, or result summary.\n"
                     "- Bullets and supporting_points must be concrete and grounded in the digest or retrieved chunks when provided.\n"
-                    "- Each slide must include citations, evidence_refs, grounding_status, and source_notes.\n"
+                    "- Each non-cover slide must include citations, evidence_refs, grounding_status, and source_notes.\n"
                     "- If source_context contains evidence_items, citations and evidence_refs may only reference their evidence_id values.\n"
-                    "- If a slide uses a figure, set layout to figure_with_caption and put the figure evidence_id in content.figure_ids.\n"
+                    "- If a slide uses a figure, put the figure evidence_id in content.figure_ids and explain the choice in content.visual_reason.\n"
+                    "- For result slides, prefer table_ids, metrics, or content.result_summary grounded in evidence.\n"
+                    "- If evidence is insufficient, use cautious wording and mark needs_verification in quality_checks or content.grounding_status.\n"
                     "- Keep image fields empty for non-image slides.\n"
                 ),
             },

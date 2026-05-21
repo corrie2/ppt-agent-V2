@@ -57,7 +57,7 @@ def run_shell(
     output_fn(f"Input directory: {current_session.input_dir}")
     output_fn(f"Output directory: {current_session.output_dir}")
     _prompt_assistant_mode(current_session, input_fn=input_fn, output_fn=output_fn)
-    _prompt_user_skills(current_session, input_fn=input_fn, output_fn=output_fn)
+    _announce_user_skills(current_session, output_fn=output_fn)
 
     while True:
         try:
@@ -89,6 +89,16 @@ def run_shell(
             continue
 
         if is_build_status_query(text):
+            if (
+                current_session.assistant_enabled
+                and not current_session.latest_plan_path
+                and not current_session.latest_ppt_path
+                and not current_session.pending_action
+                and _advance_draft_to_plan_if_possible(
+                    current_session, registry=current_registry, output_fn=output_fn, allow_default_topic=True
+                )
+            ):
+                continue
             for line in render_build_status_response(current_session):
                 output_fn(line)
             continue
@@ -105,8 +115,8 @@ def run_shell(
 
         disabled_skill = _explicit_disabled_user_skill(text, current_session)
         if disabled_skill:
-            output_fn(f"{disabled_skill} is installed but not enabled for this session.")
-            output_fn(f"Run `/skills enable {disabled_skill}` or restart and choose it at startup.")
+            output_fn(f"{disabled_skill} is disabled for this session.")
+            output_fn(f"Run `/skills enable {disabled_skill}` to make it available again.")
             continue
 
         if is_approval_utterance(text):
@@ -162,51 +172,18 @@ def _prompt_assistant_mode(session: ShellSession, *, input_fn, output_fn) -> Non
         output_fn("Please choose 1 or 2.")
 
 
-def _prompt_user_skills(session: ShellSession, *, input_fn, output_fn) -> None:
+def _announce_user_skills(session: ShellSession, *, output_fn) -> None:
     if not session.available_user_skills:
         output_fn("No user skills found.")
         return
-    output_fn("Available user skills:")
-    records = [record for record in session.user_skill_records if record.get("enabled") and record["name"] in session.available_user_skills]
-    for index, record in enumerate(records, start=1):
-        output_fn(f"{index}. {record['name']} - {record.get('description', '')}")
-    output_fn("Choose skills for this session:")
-    output_fn("0. None")
-    output_fn("all. Enable all")
-    output_fn("Or enter numbers, e.g. 1 or 1,2")
-    try:
-        choice = input_fn("Choose skills [0/all/1,2]: ").strip()
-    except EOFError:
-        choice = "0"
-    selected: list[str] = []
-    if choice.lower() == "all":
-        selected = list(session.available_user_skills)
-    elif choice and choice != "0":
-        by_index = {str(index): record["name"] for index, record in enumerate(records, start=1)}
-        for part in [item.strip() for item in choice.split(",") if item.strip()]:
-            if part in by_index:
-                selected.append(by_index[part])
-            elif part in session.available_user_skills:
-                selected.append(part)
-    session.enabled_user_skills = _unique_existing_user_skills(selected, session)
-    output_fn(
-        "Enabled user skills: "
-        + (", ".join(session.enabled_user_skills) if session.enabled_user_skills else "none")
-    )
-
-
-def _unique_existing_user_skills(names: list[str], session: ShellSession) -> list[str]:
-    result: list[str] = []
-    for name in names:
-        if name in session.available_user_skills and name not in result:
-            result.append(name)
-    return result
+    active = [name for name in session.available_user_skills if name not in session.disabled_user_skills]
+    output_fn("Available user skills: " + (", ".join(active) if active else "none"))
 
 
 def _explicit_disabled_user_skill(text: str, session: ShellSession) -> str | None:
     normalized = text.lower()
-    for name in session.available_user_skills:
-        if name.lower() in normalized and name not in session.enabled_user_skills:
+    for name in session.disabled_user_skills:
+        if name.lower() in normalized:
             return name
     return None
 
@@ -419,8 +396,14 @@ def _is_plan_start_utterance(text: str) -> bool:
         "\u5f00\u59cb",
         "\u7ee7\u7eed",
         "\u751f\u6210",
+        "\u5236\u4f5c",
+        "\u5f00\u59cb\u505a",
+        "\u5f00\u59cb\u5236\u4f5c",
         "\u751f\u6210\u8ba1\u5212",
         "\u5f00\u59cb\u751f\u6210",
+        "\u5236\u4f5c\u597d\u4e86\u544a\u8bc9\u6211",
+        "\u5236\u4f5c\u597d\u544a\u8bc9\u6211",
+        "\u505a\u597d\u4e86\u544a\u8bc9\u6211",
         "\u5c31\u8fd9\u6837",
         "\u53ef\u4ee5",
         "start",
@@ -468,6 +451,7 @@ def _continue_pending_user_request_after_scan(*, session: ShellSession, registry
             "min_slides": request.min_slides,
             "audience": request.audience,
             "tone": request.tone,
+            "output_name": request.output_name,
         }
     )
     topic = request.topic or request.text
@@ -480,6 +464,7 @@ def _continue_pending_user_request_after_scan(*, session: ShellSession, registry
         "min_slides": request.min_slides,
         "audience": request.audience,
         "tone": request.tone,
+        "output_name": request.output_name,
     }
     arguments = registry.validate_arguments("generate_plan", arguments)
     arguments = _prepare_generate_plan_arguments(session, registry=registry, arguments=arguments, output_fn=output_fn)
@@ -530,6 +515,10 @@ def _set_pending_build_from_plan_result(result: dict, *, session: ShellSession, 
         output_fn(f"- Audience: {session.draft_request.audience}")
     if result.get("plan_summary"):
         output_fn(f"- Summary: {result['plan_summary']}")
+    if session.latest_evidence_path:
+        output_fn(f"- Evidence: {session.latest_evidence_path}")
+    for warning in session.latest_evidence_warnings[:3]:
+        output_fn(f"Warning: {warning}")
     output_format = result.get("output_format") or session.draft_request.output_format or "pptx"
     applied_skills = result.get("applied_skills") or session.draft_request.applied_skills
     if applied_skills:
@@ -537,7 +526,11 @@ def _set_pending_build_from_plan_result(result: dict, *, session: ShellSession, 
     output_fn(f"- Output format: {output_format}")
     selected_names = [Path(path).name for path in session.selected_pdf_paths()]
     if output_format == "html" and "guizang-ppt-skill" in applied_skills:
-        deck_name = f"{Path(selected_names[0]).stem}.html" if len(selected_names) == 1 else "shell-deck.html"
+        deck_name = _requested_output_filename(
+            session,
+            default_stem=Path(selected_names[0]).stem if len(selected_names) == 1 else "shell-deck",
+            suffix=".html",
+        )
         skill_name = "build_html_deck"
         arguments = {
             "plan_path": result["plan_path"],
@@ -548,7 +541,11 @@ def _set_pending_build_from_plan_result(result: dict, *, session: ShellSession, 
         description = "build HTML deck from the generated plan"
         final_line = "Plan ready. Run /approve to build the HTML deck."
     else:
-        deck_name = f"{Path(selected_names[0]).stem}.pptx" if len(selected_names) == 1 else "shell-deck.pptx"
+        deck_name = _requested_output_filename(
+            session,
+            default_stem=Path(selected_names[0]).stem if len(selected_names) == 1 else "shell-deck",
+            suffix=".pptx",
+        )
         skill_name = "build_ppt"
         arguments = {"plan_path": result["plan_path"], "output_path": str(session.output_dir / deck_name)}
         description = "build PPT from the generated plan"
@@ -594,9 +591,7 @@ def _prepare_generate_plan_arguments(
             for warning in ingest_result.get("warnings", []):
                 output_fn(f"Warning: {warning}")
         if "digest_pdf_sources" in registry.names():
-            output_fn("-> digesting source evidence...")
-            digest_result = registry.invoke("digest_pdf_sources", sources=sources)
-            prepared["source_digest"] = digest_result.get("source_digest")
+            output_fn("-> preparing MinerU/source evidence during planning...")
         if "retrieve_source_context" in registry.names():
             output_fn("-> retrieving source context...")
             context_result = registry.invoke("retrieve_source_context", sources=sources, query=topic, limit=5)
@@ -604,10 +599,6 @@ def _prepare_generate_plan_arguments(
             for warning in context_result.get("warnings", []):
                 output_fn(f"Warning: {warning}")
 
-    if session.enabled_user_skills and not prepared.get("applied_skills"):
-        chosen = session.enabled_user_skills[0]
-        output_fn(f"-> loading enabled skill: {chosen}")
-        prepared["applied_skills"] = [chosen]
     return registry_safe_arguments(prepared)
 
 
@@ -641,7 +632,7 @@ def _qa_generated_plan(result: dict, *, session: ShellSession, registry: SkillRe
 def _merge_draft_into_generate_plan_arguments(session: ShellSession, arguments: dict) -> dict:
     merged = session.draft_request.to_generate_plan_arguments(arguments.get("sources") or session.selected_pdf_paths())
     merged.update({key: value for key, value in arguments.items() if value not in (None, [], "")})
-    for key in ("topic", "audience", "tone", "min_slides", "slides", "sources", "output_format", "applied_skills", "theme", "skill_root", "skill_md_path"):
+    for key in ("topic", "audience", "tone", "min_slides", "slides", "sources", "output_format", "output_name", "applied_skills", "theme", "skill_root", "skill_md_path"):
         value = getattr(session.draft_request, "slide_count" if key == "slides" else key, None)
         if key == "sources":
             value = session.draft_request.selected_sources
@@ -652,3 +643,13 @@ def _merge_draft_into_generate_plan_arguments(session: ShellSession, arguments: 
 
 def registry_safe_arguments(arguments: dict) -> dict:
     return {key: value for key, value in arguments.items() if value not in (None, [], "")}
+
+
+def _requested_output_filename(session: ShellSession, *, default_stem: str, suffix: str) -> str:
+    requested = (session.draft_request.output_name or "").strip()
+    if not requested:
+        return f"{default_stem}{suffix}"
+    name = Path(requested).name
+    if not Path(name).suffix:
+        name = f"{name}{suffix}"
+    return name

@@ -27,6 +27,7 @@ class PendingUserRequest:
     min_slides: int | None = None
     audience: str | None = None
     tone: str | None = None
+    output_name: str | None = None
 
 
 @dataclass
@@ -41,6 +42,7 @@ class DraftPptRequest:
     selected_sources: list[str] = field(default_factory=list)
     exclude_other_sources: bool = False
     output_format: str = "pptx"
+    output_name: str | None = None
     applied_skills: list[str] = field(default_factory=list)
     theme: str | None = None
     skill_root: str | None = None
@@ -50,7 +52,7 @@ class DraftPptRequest:
         if values.get("slides") and not values.get("slide_count"):
             values = dict(values)
             values["slide_count"] = values["slides"]
-        for key in ("topic", "audience", "tone", "requested_pdf_name", "output_format", "theme", "skill_root", "skill_md_path"):
+        for key in ("topic", "audience", "tone", "requested_pdf_name", "output_format", "output_name", "theme", "skill_root", "skill_md_path"):
             value = values.get(key)
             if value:
                 setattr(self, key, value)
@@ -77,6 +79,7 @@ class DraftPptRequest:
             "min_slides": self.min_slides,
             "slides": self.slide_count,
             "output_format": self.output_format,
+            "output_name": self.output_name,
             "applied_skills": self.applied_skills,
             "theme": self.theme,
             "skill_root": self.skill_root,
@@ -106,6 +109,8 @@ class ShellSession:
     selected_sources: list[str] = field(default_factory=list)
     latest_plan_path: str | None = None
     latest_plan_sources: list[str] = field(default_factory=list)
+    latest_evidence_path: str | None = None
+    latest_evidence_warnings: list[str] = field(default_factory=list)
     latest_ppt_path: str | None = None
     latest_html_path: str | None = None
     last_build_status: str | None = None
@@ -120,6 +125,7 @@ class ShellSession:
     user_skill_records: list[dict] = field(default_factory=list)
     available_user_skills: list[str] = field(default_factory=list)
     enabled_user_skills: list[str] = field(default_factory=list)
+    disabled_user_skills: list[str] = field(default_factory=list)
     recent_messages: list[dict] = field(default_factory=list)
     active_skill_context: str | None = None
     active_skill_name: str | None = None

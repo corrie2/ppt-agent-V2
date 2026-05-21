@@ -18,7 +18,8 @@ def merge_text_into_draft(session: ShellSession, text: str) -> dict:
     extracted = extract_request_constraints(text)
     if extracted:
         session.draft_request.merge(extracted)
-    _sync_selected_sources(session)
+    if not (extracted.get("requested_pdf_name") or extracted.get("requested_pdf_index")):
+        _sync_selected_sources(session)
     return extracted
 
 
@@ -32,6 +33,9 @@ def extract_request_constraints(text: str) -> dict:
         values["theme"] = "magazine"
     if _is_exclude_other_sources_confirmation(text):
         values["exclude_other_sources"] = True
+    output_name = _extract_output_name(text)
+    if output_name:
+        values["output_name"] = output_name
     requested_pdf = _extract_requested_pdf_name(text)
     if requested_pdf:
         values["requested_pdf_name"] = requested_pdf
@@ -107,7 +111,9 @@ def render_draft_feedback(session: ShellSession) -> list[str]:
         lines.append(f"- Applied skill: {', '.join(draft.applied_skills)}")
     if draft.output_format:
         lines.append(f"- Output format: {draft.output_format}")
-    else:
+    if draft.output_name:
+        lines.append(f"- Output name: {draft.output_name}")
+    if not draft.topic:
         default_topic = infer_default_topic(session)
         if default_topic:
             lines.append(f'\u8fd8\u7f3a\u5c11\u4e3b\u9898\u3002\u4f60\u53ef\u4ee5\u8f93\u5165\u201c\u8bba\u6587\u4ecb\u7ecd\u201d\uff0c\u6216\u8f93\u5165\u201c\u5f00\u59cb\u201d\u4f7f\u7528\u9ed8\u8ba4\u4e3b\u9898\uff1a{default_topic}\u3002')
@@ -229,6 +235,8 @@ def _extract_audience(text: str) -> str | None:
         token in normalized or token in compact
         for token in (
             "\u7814\u7a76\u751f\u8bba\u6587\u8bb2\u89e3",
+            "\u7814\u7a76\u751f\u6c47\u62a5",
+            "\u7814\u7a76\u751f\u6c47\u62a5\u7528",
             "\u7ed9\u7814\u7a76\u751f\u8bb2",
             "\u9762\u5411\u7814\u7a76\u751f",
             "\u7814\u7a76\u751f\u8bfe\u7a0b",
@@ -247,6 +255,21 @@ def _extract_audience(text: str) -> str | None:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return match.group(1).strip()
+    return None
+
+
+def _extract_output_name(text: str) -> str | None:
+    for pattern in (
+        r"\u8f93\u51fa\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|是)?\s*([A-Za-z0-9_.-]+)",
+        r"\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|是)?\s*([A-Za-z0-9_.-]+)",
+        r"\u8f93\u51fa(?:\u5230|\u4e3a|叫)?\s*([A-Za-z0-9_.-]+)",
+        r"output(?:\s+file(?:\s+name)?)?\s*(?:is|as|to|called)?\s*([A-Za-z0-9_.-]+)",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip().strip(".")
+            if candidate.lower() not in {"ppt", "pptx", "pdf", "html", "file", "deck"}:
+                return candidate
     return None
 
 

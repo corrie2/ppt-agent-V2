@@ -26,11 +26,28 @@ class DeckIntent(BaseModel):
     failure_patterns: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class VisualCallout(BaseModel):
+    label: str
+    text: str
+    target: str | None = None
+    evidence_id: str | None = None
+
+
+class ResultSummary(BaseModel):
+    metric: str | None = None
+    finding: str = ""
+    evidence_id: str | None = None
+
+
 class SlideContent(BaseModel):
     bullets: list[str] = Field(default_factory=list)
     figure_ids: list[str] = Field(default_factory=list)
     table_ids: list[str] = Field(default_factory=list)
     metrics: list[dict[str, Any]] = Field(default_factory=list)
+    visual_reason: str = ""
+    callouts: list[VisualCallout] = Field(default_factory=list)
+    result_summary: list[ResultSummary] = Field(default_factory=list)
+    grounding_status: str = "grounded"
 
 
 class Citation(BaseModel):
@@ -123,10 +140,13 @@ class AgentState(BaseModel):
     mode: AgentMode = AgentMode.EXECUTE
     planner_provider: str | None = None
     planner_model: str | None = None
+    allow_fallback: bool = False
     approved: bool = False
     transitions: list[str] = Field(default_factory=list)
     asset_warnings: list[str] = Field(default_factory=list)
     spec: PptSpec | None = None
     artifact: Artifact | None = None
+    visual_quality_report: dict | None = None
+    visual_quality_report_path: str | None = None
     qa_issues: list[QaIssue] = Field(default_factory=list)
     repair_attempts: int = 0
