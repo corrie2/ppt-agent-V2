@@ -1,0 +1,106 @@
+{
+  "name": "executive-design",
+  "description": "汇报PPT设计规范",
+  "version": "1.0.0",
+  "type": "design",
+  "agent_scope": ["design_chart", "page_designer"],
+  "rules": [
+    "使用专业配色方案：主色#1a365d（深蓝）、辅色#2b6cb0（浅蓝）、背景#ffffff（白）",
+    "标题字体：32pt Microsoft YaHei Bold",
+    "正文字体：20pt Microsoft YaHei Regular",
+    "留白充足，内容密度适中",
+    "图表优先于文字，数据可视化",
+    "保持视觉一致性，避免风格混乱",
+    "使用高质量图片和图标",
+    "动画要简洁，避免花哨"
+  ],
+  "color_scheme": {
+    "primary": "#1a365d",
+    "secondary": "#2b6cb0",
+    "accent": "#3182ce",
+    "background": "#ffffff",
+    "text_primary": "#1a202c",
+    "text_secondary": "#4a5568",
+    "border": "#e2e8f0",
+    "success": "#38a169",
+    "warning": "#d69e2e",
+    "error": "#e53e3e"
+  },
+  "typography": {
+    "title": {
+      "font": "Microsoft YaHei",
+      "size": 32,
+      "weight": "bold",
+      "color": "#1a365d"
+    },
+    "subtitle": {
+      "font": "Microsoft YaHei",
+      "size": 24,
+      "weight": "bold",
+      "color": "#2b6cb0"
+    },
+    "body": {
+      "font": "Microsoft YaHei",
+      "size": 20,
+      "weight": "regular",
+      "color": "#1a202c"
+    },
+    "caption": {
+      "font": "Microsoft YaHei",
+      "size": 14,
+      "weight": "regular",
+      "color": "#4a5568"
+    }
+  },
+  "layout": {
+    "title_page": {
+      "description": "封面页布局",
+      "elements": ["主标题", "副标题", "汇报人", "日期"],
+      "alignment": "center",
+      "background": "gradient or solid color"
+    },
+    "content_page": {
+      "description": "内容页布局",
+      "elements": ["标题栏", "内容区域", "页码"],
+      "margins": {"top": 80, "bottom": 60, "left": 80, "right": 80}
+    },
+    "chart_page": {
+      "description": "图表页布局",
+      "elements": ["标题", "图表", "注释"],
+      "chart_size": "70% of content area"
+    },
+    "summary_page": {
+      "description": "总结页布局",
+      "elements": ["关键发现", "建议", "下一步"],
+      "style": "card layout"
+    }
+  },
+  "chart_guidelines": {
+    "bar_chart": {
+      "use_case": "分类对比",
+      "max_categories": 8,
+      "color": "use primary color palette"
+    },
+    "line_chart": {
+      "use_case": "趋势分析",
+      "max_lines": 5,
+      "color": "use primary color palette"
+    },
+    "pie_chart": {
+      "use_case": "占比分析",
+      "max_slices": 6,
+      "color": "use primary color palette"
+    },
+    "table": {
+      "use_case": "详细数据展示",
+      "max_rows": 10,
+      "style": "clean, minimal borders"
+    }
+  },
+  "visual_elements": {
+    "icons": "use simple, professional icons",
+    "images": "use high-quality, relevant images",
+    "shapes": "use simple geometric shapes",
+    "gradients": "use subtle gradients for backgrounds"
+  }
+}

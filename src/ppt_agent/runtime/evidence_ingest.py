@@ -89,13 +89,35 @@ def load_evidence_pack(path: str | Path | None) -> tuple[EvidencePack | None, Pa
         return None, evidence_path, [f"failed to load evidence pack {evidence_path}: {exc}"]
 
 
-def attach_evidence_figures_to_spec(spec: PptSpec, pack: EvidencePack | None) -> PptSpec:
+def attach_evidence_figures_to_spec(
+    spec: PptSpec,
+    pack: EvidencePack | None,
+    selected_figure_ids: list[str] | None = None,
+) -> PptSpec:
     if not pack or not pack.figures:
         return spec
-    if any(slide.content.figure_ids for slide in spec.slides):
-        return spec
 
-    figures = _selected_figures(pack.figures, max_items=min(4, max(1, len(spec.slides) // 4)))
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Priority: user selection > LLM assignment > auto-select
+    if selected_figure_ids:
+        # User selected figures — always use these, overwrite LLM's assignments
+        figures = [f for f in pack.figures if f.id in selected_figure_ids]
+        logger.info("Using %d user-selected figures: %s", len(figures), [f.id for f in figures])
+    elif any(slide.content.figure_ids for slide in spec.slides):
+        # LLM already assigned figures, user didn't select — keep LLM's choices
+        assigned_ids = {
+            fid for slide in spec.slides for fid in slide.content.figure_ids
+        }
+        logger.info("Keeping LLM-assigned figures: %s", assigned_ids)
+        return spec
+    else:
+        # No user selection, no LLM assignment — auto-select
+        max_figures = max(3, min(len(pack.figures), len(spec.slides) // 2))
+        figures = _selected_figures(pack.figures, max_items=max_figures)
+        logger.info("Auto-selected %d figures", len(figures))
+
     if not figures:
         return spec
 
@@ -113,6 +135,9 @@ def attach_evidence_figures_to_spec(spec: PptSpec, pack: EvidencePack | None) ->
             slide.citations.append(Citation(evidence_id=figure.id, page=figure.page, source_file=figure.source_file))
         if figure.id not in slide.evidence_refs:
             slide.evidence_refs.append(figure.id)
+
+    used_ids = [f.id for f in figures]
+    logger.info("Final figure assignments: %d figures on slides %s", len(figures), list(candidate_indexes))
     return spec.model_copy(update={"slides": slides})
 
 
@@ -147,10 +172,11 @@ SECTION_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 FIGURE_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "method_overview": ("framework", "architecture", "pipeline", "overview", "workflow"),
-    "algorithm_or_component": ("algorithm", "module", "component"),
-    "result": ("result", "performance", "comparison", "benchmark"),
-    "analysis_or_ablation": ("ablation", "sensitivity", "analysis", "case study"),
+    "method_overview": ("framework", "architecture", "pipeline", "overview", "workflow", "system", "design"),
+    "algorithm_or_component": ("algorithm", "module", "component", "mechanism", "structure"),
+    "result": ("result", "performance", "comparison", "benchmark", "evaluation", "experiment"),
+    "analysis_or_ablation": ("ablation", "sensitivity", "analysis", "case study", "visualization"),
+    "motivation_or_example": ("example", "illustration", "motivation", "scenario", "use case"),
 }
 
 TABLE_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -258,7 +284,7 @@ def _score_section(section: SectionEvidence) -> tuple[SectionEvidence, str, str,
     return section, best_role, why, score
 
 
-def _select_figures(figures: list[FigureAsset], *, max_items: int = 12) -> list[tuple[FigureAsset, str, str, float]]:
+def _select_figures(figures: list[FigureAsset], *, max_items: int = 20) -> list[tuple[FigureAsset, str, str, float]]:
     scored = [_score_visual(figure, FIGURE_ROLE_KEYWORDS, fallback_role="supporting_figure") for figure in figures]
     return _pick_by_role_then_score(scored, max_items=max_items)
 

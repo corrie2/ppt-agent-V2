@@ -32,6 +32,12 @@ def build_html_deck(
 def _read_template(template_path: Path | None) -> str:
     if template_path and template_path.exists() and template_path.is_file():
         return template_path.read_text(encoding="utf-8")
+    
+    # Try to load professional template from templates directory
+    professional_template = Path(__file__).parent.parent.parent / "templates" / "professional.html"
+    if professional_template.exists():
+        return professional_template.read_text(encoding="utf-8")
+    
     return """<!doctype html>
 <html lang="zh-CN">
 <head>

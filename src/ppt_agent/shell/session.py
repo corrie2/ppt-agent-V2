@@ -8,7 +8,7 @@ from ppt_agent.storage.project_memory import ensure_project_memory
 
 
 DEFAULT_ASSISTANT_PROVIDER = "deepseek"
-DEFAULT_ASSISTANT_MODEL = "deepseek-v4-flash"
+DEFAULT_ASSISTANT_MODEL = "deepseek-v4-pro"
 
 
 @dataclass
@@ -105,15 +105,19 @@ class ShellSession:
     cwd: Path
     input_dir: Path
     output_dir: Path
+    workspace_dir: Path  # New: workspace folder for scanning
     discovered_sources: list[dict] = field(default_factory=list)
     selected_sources: list[str] = field(default_factory=list)
     latest_plan_path: str | None = None
     latest_plan_sources: list[str] = field(default_factory=list)
     latest_evidence_path: str | None = None
     latest_evidence_warnings: list[str] = field(default_factory=list)
+    selected_figure_ids: list[str] = field(default_factory=list)  # User-selected figures for PPT
     latest_ppt_path: str | None = None
+    output_fn: Any = None  # Callable[[str], None] | None — callback for progress logging
     latest_html_path: str | None = None
     last_build_status: str | None = None
+    last_thinking: str | None = None
     current_request: str | None = None
     assistant_enabled: bool = False
     assistant_provider: str | None = None
@@ -135,8 +139,10 @@ class ShellSession:
         root = (cwd or Path.cwd()).resolve()
         input_dir = root / "input"
         output_dir = root / "output"
+        workspace_dir = root / "workspace"  # New: workspace folder
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
+        workspace_dir.mkdir(parents=True, exist_ok=True)  # Create workspace folder
         ensure_project_memory(root)
 
         selection = load_selection(root)
@@ -146,6 +152,7 @@ class ShellSession:
             cwd=root,
             input_dir=input_dir,
             output_dir=output_dir,
+            workspace_dir=workspace_dir,  # Add workspace_dir
             assistant_provider=provider,
             assistant_model=model,
         )

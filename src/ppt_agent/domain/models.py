@@ -27,10 +27,16 @@ class DeckIntent(BaseModel):
 
 
 class VisualCallout(BaseModel):
-    label: str
-    text: str
+    label: str = ""
+    text: str = ""
+    detail: str = ""  # Support alternative field name from LLM
     target: str | None = None
     evidence_id: str | None = None
+    
+    def model_post_init(self, __context) -> None:
+        # Sync detail to text if text is empty
+        if not self.text and self.detail:
+            self.text = self.detail
 
 
 class ResultSummary(BaseModel):
@@ -48,6 +54,38 @@ class SlideContent(BaseModel):
     callouts: list[VisualCallout] = Field(default_factory=list)
     result_summary: list[ResultSummary] = Field(default_factory=list)
     grounding_status: str = "grounded"
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_list_fields(cls, data: Any) -> Any:
+        """Normalize fields that expect lists: None→[], dict→[dict], string metrics→[dict]."""
+        if isinstance(data, dict):
+            # result_summary: None→[], dict→[dict]
+            rs = data.get("result_summary")
+            if rs is None:
+                data["result_summary"] = []
+            elif isinstance(rs, dict):
+                data["result_summary"] = [rs]
+
+            # callouts: None→[], dict→[dict]
+            co = data.get("callouts")
+            if co is None:
+                data["callouts"] = []
+            elif isinstance(co, dict):
+                data["callouts"] = [co]
+
+            # metrics: None→[], string→[{"finding": str}], string items→[{"finding": str}]
+            mt = data.get("metrics")
+            if mt is None:
+                data["metrics"] = []
+            elif isinstance(mt, str):
+                data["metrics"] = [{"finding": mt}]
+            elif isinstance(mt, list):
+                data["metrics"] = [
+                    {"finding": m} if isinstance(m, str) else m
+                    for m in mt
+                ]
+        return data
 
 
 class Citation(BaseModel):
@@ -104,6 +142,48 @@ class SlideSpec(BaseModel):
             self.evidence_refs = [citation.evidence_id for citation in self.citations]
         elif self.evidence_refs and not self.citations:
             self.citations = [Citation(evidence_id=evidence_id) for evidence_id in self.evidence_refs]
+
+        return self
+
+    @model_validator(mode="after")
+    def sanitize_text_fields(self) -> "SlideSpec":
+        """Clean LLM artifacts: vertical tabs, control chars, duplicate bullets."""
+        # Clean \x0b (vertical tab) → newline in all string fields
+        for field_name in ("title", "message", "core_message", "objective",
+                           "speaker_notes", "image_caption", "image_rationale"):
+            val = getattr(self, field_name, "")
+            if val and "\x0b" in val:
+                object.__setattr__(self, field_name, val.replace("\x0b", "\n").strip())
+
+        # Clean bullets: deduplicate, remove role labels, strip control chars
+        ROLE_LABELS = {
+            "title", "problem or motivation", "contribution", "method detail",
+            "method overview", "experiment setup", "result", "ablation",
+            "conclusion", "takeaways", "limitation", "future work",
+        }
+        for bullets_attr in ("bullets",):
+            raw = getattr(self, bullets_attr, [])
+            if not raw:
+                continue
+            cleaned = []
+            seen = set()
+            for b in raw:
+                if not b:
+                    continue
+                # Clean control chars
+                b = b.replace("\x0b", " ").replace("\x00", "").strip()
+                if not b:
+                    continue
+                # Skip role labels
+                if b.lower().rstrip(".") in ROLE_LABELS:
+                    continue
+                # Deduplicate (by first 80 chars)
+                key = b[:80].lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append(b)
+            object.__setattr__(self, bullets_attr, cleaned)
 
         return self
 

@@ -1,30 +1,49 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import threading
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
+
+# Shared HTTP client with connection pooling (thread-safe)
+_http_client: httpx.Client | None = None
+_http_client_lock = threading.Lock()
+
+
+def _get_http_client() -> httpx.Client:
+    global _http_client
+    with _http_client_lock:
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.Client(timeout=180.0)
+        return _http_client
 
 from ppt_agent.agent.skill_registry import SkillRegistry
 from ppt_agent.llm.providers import PROVIDER_SPECS
 from ppt_agent.shell.session import PendingUserRequest, ShellSession
 from ppt_agent.storage.llm_settings import load_api_key
 
+# Constants
+SKILL_DESCRIPTION_BUDGET = 8000
+
 
 class SkillCall(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    auto_approve: bool = False  # Skip approval when called by chat agent
 
 
 class RouterDecision(BaseModel):
     reply: str
     skill_calls: list[SkillCall] = Field(default_factory=list)
+    thinking: str | None = None
 
 
 class ChatAgent:
-    def respond(self, session: ShellSession, message: str, registry: SkillRegistry | None = None) -> RouterDecision:
+    def respond(self, session: ShellSession, message: str, registry: SkillRegistry | None = None, history: list[dict[str, str]] | None = None) -> RouterDecision:
         if not session.assistant_enabled:
             return RouterDecision(
                 reply="Current mode is manual CLI. Use /help to see commands, or use /files, /select, /plan, and /build.",
@@ -47,9 +66,16 @@ class ChatAgent:
             )
 
         try:
-            return self._route_with_llm(session, message, registry=registry, api_key=api_key)
-        except Exception:
-            return self._route_with_fallback(session, message, registry=registry)
+            return self._route_with_llm(session, message, registry=registry, api_key=api_key, history=history)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("LLM routing failed, using fallback: %s", exc)
+            decision = self._route_with_fallback(session, message, registry=registry)
+            # MEDIUM: Inform user about fallback (Issue 6)
+            fallback_note = "(Using quick response mode - AI routing temporarily unavailable)"
+            if decision.reply:
+                decision = decision.model_copy(update={"reply": f"{fallback_note}\n{decision.reply}"})
+            return decision
 
     def _route_with_llm(
         self,
@@ -58,23 +84,28 @@ class ChatAgent:
         *,
         registry: SkillRegistry | None,
         api_key: str,
+        history: list[dict[str, str]] | None = None,
     ) -> RouterDecision:
         provider = session.assistant_provider
         model = session.assistant_model
         if not provider or not model:
             return self._route_with_fallback(session, message, registry=registry)
 
-        payload = {
-            "model": model,
-            "temperature": 0.1,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": self._system_prompt(registry, disabled_user_skills=session.disabled_user_skills),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
+        # Build messages: system prompt + conversation history + current message
+        messages = [
+            {
+                "role": "system",
+                "content": self._system_prompt(registry, disabled_user_skills=session.disabled_user_skills),
+            },
+        ]
+        # Add conversation history (last 10 rounds)
+        if history:
+            for entry in history[-20:]:  # max 20 messages = 10 rounds
+                messages.append({"role": entry["role"], "content": entry["content"]})
+        # Add current user message with context
+        messages.append({
+            "role": "user",
+            "content": json.dumps(
                         {
                             "message": message,
                             "cwd": str(session.cwd),
@@ -101,18 +132,37 @@ class ChatAgent:
                         ensure_ascii=False,
                     ),
                 },
-            ],
-        }
-        response = httpx.post(
-            f"{PROVIDER_SPECS[provider].base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=45.0,
         )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        data = self._extract_json(content)
-        return RouterDecision.model_validate(data)
+        payload = {
+            "model": model,
+            "temperature": 0.1,
+            "messages": messages,
+        }
+        import time as _time
+        last_exc: Exception | None = None
+        for _attempt in range(3):
+            try:
+                response = _get_http_client().post(
+                    f"{PROVIDER_SPECS[provider].base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+                response.raise_for_status()
+                result = response.json()
+                message_data = result["choices"][0]["message"]
+                content = message_data["content"]
+                thinking = message_data.get("reasoning_content") or message_data.get("thinking")
+                data = self._extract_json(content)
+                decision = RouterDecision.model_validate(data)
+                if thinking:
+                    decision = decision.model_copy(update={"thinking": thinking})
+                return decision
+            except Exception as exc:
+                last_exc = exc
+                logging.getLogger(__name__).warning("LLM routing attempt %d failed: %s", _attempt + 1, exc)
+                if _attempt < 2:
+                    _time.sleep(min(2 ** (_attempt + 1), 8))
+        raise last_exc  # type: ignore[misc]
 
     def _route_with_fallback(
         self,
@@ -193,11 +243,28 @@ class ChatAgent:
 
     def _extract_json(self, content: str) -> dict[str, Any]:
         text = content.strip()
+        # Try parsing the whole text first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        # Find the first { and match balanced braces
         start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1:
+        if start == -1:
             raise ValueError("router response did not contain JSON")
-        return json.loads(text[start : end + 1])
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(text[start : i + 1])
+        # Fallback: try first { to last }
+        end = text.rfind("}")
+        if end > start:
+            return json.loads(text[start : end + 1])
+        raise ValueError("router response did not contain valid JSON")
 
     def _available_skills(
         self,
@@ -209,7 +276,7 @@ class ChatAgent:
         if registry is None:
             return [{"name": name} for name in self._default_skill_names()]
         descriptions: list[dict[str, Any]] = []
-        budget = 8000
+        budget = SKILL_DESCRIPTION_BUDGET
         used = 0
         enabled = set(enabled_user_skills or [])
         disabled = set(disabled_user_skills or [])
@@ -246,18 +313,49 @@ class ChatAgent:
         disabled_user_skills: list[str] | None = None,
     ) -> str:
         sections = {
-            "identity": "You are an orchestration agent for a PPT shell.",
-            "behavior": "Return JSON only with keys: reply, skill_calls. Each skill_call must have name and arguments.",
+            "identity": (
+                "You are a helpful PPT assistant. You can chat naturally about anything, "
+                "and you have tools to help users create presentations from PDF documents or topics."
+            ),
+            "behavior": (
+                "Return JSON only with keys: reply, skill_calls. Each skill_call must have name and arguments.\n"
+                "Always reply in the user's language (Chinese if they speak Chinese).\n"
+                "Be conversational and friendly, not robotic."
+            ),
             "tool_policy": (
                 f"Available skills: {json.dumps(self._available_skills(registry, enabled_user_skills=enabled_user_skills, disabled_user_skills=disabled_user_skills), ensure_ascii=False)}. "
                 "Fail closed on unknown tools or invalid arguments."
             ),
             "state_context": "The shell provides cwd, input/output dirs, sources, draft_request, latest artifacts, pending_action, provider and model.",
-            "planning_policy": (
-                "If selected_sources is non-empty, treat those PDFs as active unless the user explicitly changes files. "
-                "Before generating a plan, use retrieve_project_memory and retrieve_failure_patterns when available. "
-                "When the user gives feedback such as visual dislikes, too much body text, or preferred style, record it with record_project_memory. "
-                "For file-writing actions, propose skill calls only; the shell requires explicit approval before build."
+            "ppt_workflow": (
+                "When the user asks to create a PPT (e.g., '做一份PPT', 'generate slides', 'make a deck'):\n"
+                "1. First, propose what you will do (topic, audience, sources, style) and ask for confirmation\n"
+                "2. After user confirms (可以/好/yes/确认), call generate_plan AND build_ppt together\n"
+                "3. For build_ppt, set auto_approve=true so it executes without manual approval\n"
+                "4. Report the result (file path, slide count, file size)\n\n"
+                "Available styles: corporate (default, business blue), academic (paper, serif font, dark red accent), "
+                "modern (clean, indigo accent, spacious), minimal (ultra-clean, side bar accent). "
+                "Auto-detect style from user message: 论文/研究生→academic, 现代/简约→modern, 极简→minimal, 商务→corporate.\n\n"
+                "Example skill_calls for confirmed PPT request:\n"
+                '[{"name": "generate_plan", "arguments": {..., "theme": "academic"}}, {"name": "build_ppt", "arguments": {}, "auto_approve": true}]\n\n'
+                "For small operations (scan files, list sources, check status), execute directly without confirmation.\n"
+                "For status queries (做好了吗, is it done), just report the current state."
+            ),
+            "conversation": (
+                "You can handle general conversation:\n"
+                "- Questions about the paper/content (summarize, explain figures, clarify methods)\n"
+                "- Questions about the PPT (what's on slide X, why this structure)\n"
+                "- Casual chat (greetings, thanks, feedback)\n"
+                "- Feedback on the PPT (too many bullets, change style, add more figures)\n\n"
+                "When the user gives feedback on a PPT, use revise_plan to update it, then rebuild."
+            ),
+            "progress": (
+                "When executing a workflow, provide progress updates:\n"
+                "- '正在解析PDF...' when parsing\n"
+                "- '正在生成计划...' when planning\n"
+                "- '正在构建PPT...' when building\n"
+                "- '做好了！' with the result when done\n\n"
+                "If something fails, explain what went wrong and suggest next steps."
             ),
         }
         return "\n\n".join(f"## {name}\n{content}" for name, content in sections.items())
@@ -284,17 +382,25 @@ class ChatAgent:
         return registry is None or name in registry.names()
 
     def _looks_like_planning(self, lower: str) -> bool:
+        # Exclude status queries - these should not trigger planning
+        status_patterns = ("做好了吗", "完成了吗", "好了吗", "is it done", "is it ready", "done了吗")
+        if any(pattern in lower for pattern in status_patterns):
+            return False
+        # Exclude confirmation messages - these should confirm a pending proposal
+        confirm_patterns = ("可以", "好的", "确认", "就这样", "yes", "ok", "go", "开始吧", "去做吧", "执行")
+        if any(pattern in lower for pattern in confirm_patterns):
+            return False
         return any(
             token in lower
             for token in (
-                "\u65b9\u6848",
-                "\u8ba1\u5212",
+                "方案",
+                "计划",
                 "plan",
                 "ppt",
                 "pdf",
-                "\u751f\u6210",
-                "\u505a",
-                "\u505a\u4e00\u4efd",
+                "生成",
+                "做",
+                "做一份",
                 "deck",
             )
         )
@@ -303,7 +409,7 @@ class ChatAgent:
         return any(token in lower for token in ("\u6587\u4ef6", "\u8d44\u6599", "pdf", "sources", "source", "list"))
 
     def _looks_like_revision(self, lower: str) -> bool:
-        return any(token in lower for token in ("\u4fee\u6539", "\u8c03\u6574", "\u4f18\u5316", "revise", "update"))
+        return any(token in lower for token in ("修改", "调整", "优化", "revise", "update"))
 
     def _looks_like_build(self, lower: str) -> bool:
         return any(
@@ -360,13 +466,9 @@ class ChatAgent:
         return None
 
     def _extract_output_name(self, message: str) -> str | None:
-        for pattern in (
-            r"\u8f93\u51fa\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|\u662f)?\s*([A-Za-z0-9_.-]+)",
-            r"\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|\u662f)?\s*([A-Za-z0-9_.-]+)",
-            r"\u8f93\u51fa(?:\u5230|\u4e3a|\u53eb)?\s*([A-Za-z0-9_.-]+)",
-            r"output(?:\s+file(?:\s+name)?)?\s*(?:is|as|to|called)?\s*([A-Za-z0-9_.-]+)",
-        ):
-            match = re.search(pattern, message, flags=re.IGNORECASE)
+        from ppt_agent.utils import OUTPUT_NAME_PATTERNS
+        for pattern in OUTPUT_NAME_PATTERNS:
+            match = pattern.search(message)
             if match:
                 candidate = match.group(1).strip().strip(".")
                 if candidate.lower() not in {"ppt", "pptx", "pdf", "html", "file", "deck"}:

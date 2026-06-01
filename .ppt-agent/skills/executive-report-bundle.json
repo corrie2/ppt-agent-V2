@@ -1,0 +1,41 @@
+{
+  "name": "executive-report-bundle",
+  "description": "汇报PPT生成完整解决方案",
+  "version": "1.0.0",
+  "author": "PPT Agent Team",
+  "skills": [
+    {
+      "name": "executive-writing",
+      "file": "executive-writing.json",
+      "type": "markdown",
+      "agent_scope": ["content", "brief_outline"],
+      "description": "面向高管汇报的slide写作规范"
+    },
+    {
+      "name": "executive-design",
+      "file": "executive-design.json",
+      "type": "design",
+      "agent_scope": ["design_chart", "page_designer"],
+      "description": "汇报PPT设计规范"
+    },
+    {
+      "name": "executive-qa",
+      "file": "executive-qa.json",
+      "type": "validation",
+      "agent_scope": ["qa"],
+      "description": "汇报PPT质量检查规范"
+    }
+  ],
+  "usage": {
+    "cli": "ppt-agent report '主题' --audience '公司高层'",
+    "mcp": "mcp call ppt-agent generate_report_ppt --topic '主题'",
+    "web": "http://localhost:8080/report"
+  },
+  "templates": [
+    "quarterly-review",
+    "project-status",
+    "annual-summary",
+    "strategy-proposal",
+    "data-analysis"
+  ]
+}

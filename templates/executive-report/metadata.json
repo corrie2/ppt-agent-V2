@@ -1,0 +1,123 @@
+{
+  "templates": {
+    "quarterly-review": {
+      "name": "季度汇报",
+      "description": "适用于季度工作汇报，包含KPI、成果、问题、计划",
+      "page_count": 12,
+      "duration": "15分钟",
+      "audience": ["公司高层", "部门领导"],
+      "sections": [
+        {"type": "cover", "title": "封面", "page_count": 1},
+        {"type": "agenda", "title": "目录", "page_count": 1},
+        {"type": "kpi", "title": "关键指标概览", "page_count": 2},
+        {"type": "achievement", "title": "重点工作成果", "page_count": 3},
+        {"type": "challenge", "title": "问题与挑战", "page_count": 2},
+        {"type": "plan", "title": "下季度计划", "page_count": 2},
+        {"type": "summary", "title": "总结与建议", "page_count": 1},
+        {"type": "qna", "title": "Q&A", "page_count": 1}
+      ],
+      "design": {
+        "primary_color": "#1a365d",
+        "secondary_color": "#2b6cb0",
+        "background": "#ffffff",
+        "font_title": "Microsoft YaHei",
+        "font_body": "Microsoft YaHei"
+      }
+    },
+    "project-status": {
+      "name": "项目进展汇报",
+      "description": "适用于项目进展汇报，包含进度、风险、资源、里程碑",
+      "page_count": 10,
+      "duration": "12分钟",
+      "audience": ["项目团队", "管理层"],
+      "sections": [
+        {"type": "cover", "title": "封面", "page_count": 1},
+        {"type": "overview", "title": "项目概览", "page_count": 1},
+        {"type": "progress", "title": "进度跟踪", "page_count": 3},
+        {"type": "risk", "title": "风险与问题", "page_count": 2},
+        {"type": "resource", "title": "资源使用", "page_count": 1},
+        {"type": "milestone", "title": "里程碑", "page_count": 1},
+        {"type": "next", "title": "下一步计划", "page_count": 1},
+        {"type": "qna", "title": "Q&A", "page_count": 1}
+      ],
+      "design": {
+        "primary_color": "#2d3748",
+        "secondary_color": "#4a5568",
+        "background": "#ffffff",
+        "font_title": "Microsoft YaHei",
+        "font_body": "Microsoft YaHei"
+      }
+    },
+    "annual-summary": {
+      "name": "年度总结",
+      "description": "适用于年度工作总结，包含全年回顾、成就、挑战、展望",
+      "page_count": 15,
+      "duration": "20分钟",
+      "audience": ["公司高层", "全体员工"],
+      "sections": [
+        {"type": "cover", "title": "封面", "page_count": 1},
+        {"type": "overview", "title": "年度概览", "page_count": 2},
+        {"type": "achievement", "title": "主要成就", "page_count": 4},
+        {"type": "data", "title": "关键数据", "page_count": 2},
+        {"type": "challenge", "title": "挑战与成长", "page_count": 2},
+        {"type": "team", "title": "团队贡献", "page_count": 2},
+        {"type": "outlook", "title": "未来展望", "page_count": 1},
+        {"type": "thanks", "title": "致谢", "page_count": 1}
+      ],
+      "design": {
+        "primary_color": "#1a365d",
+        "secondary_color": "#3182ce",
+        "background": "#ffffff",
+        "font_title": "Microsoft YaHei",
+        "font_body": "Microsoft YaHei"
+      }
+    },
+    "strategy-proposal": {
+      "name": "战略提案",
+      "description": "适用于战略规划、业务提案、投资方案等",
+      "page_count": 12,
+      "duration": "15分钟",
+      "audience": ["投资方", "董事会", "高层管理"],
+      "sections": [
+        {"type": "cover", "title": "封面", "page_count": 1},
+        {"type": "executive_summary", "title": "执行摘要", "page_count": 1},
+        {"type": "problem", "title": "问题/机会", "page_count": 2},
+        {"type": "solution", "title": "解决方案", "page_count": 3},
+        {"type": "market", "title": "市场分析", "page_count": 2},
+        {"type": "financial", "title": "财务预测", "page_count": 2},
+        {"type": "risk", "title": "风险评估", "page_count": 1},
+        {"type": "qna", "title": "Q&A", "page_count": 1}
+      ],
+      "design": {
+        "primary_color": "#2d3748",
+        "secondary_color": "#4a5568",
+        "background": "#ffffff",
+        "font_title": "Microsoft YaHei",
+        "font_body": "Microsoft YaHei"
+      }
+    },
+    "data-analysis": {
+      "name": "数据分析汇报",
+      "description": "适用于数据分析报告、业务洞察、研究结果等",
+      "page_count": 10,
+      "duration": "12分钟",
+      "audience": ["数据团队", "业务部门", "管理层"],
+      "sections": [
+        {"type": "cover", "title": "封面", "page_count": 1},
+        {"type": "objective", "title": "分析目标", "page_count": 1},
+        {"type": "methodology", "title": "分析方法", "page_count": 1},
+        {"type": "findings", "title": "关键发现", "page_count": 4},
+        {"type": "insights", "title": "业务洞察", "page_count": 2},
+        {"type": "recommendations", "title": "建议", "page_count": 1},
+        {"type": "qna", "title": "Q&A", "page_count": 1}
+      ],
+      "design": {
+        "primary_color": "#2b6cb0",
+        "secondary_color": "#3182ce",
+        "background": "#ffffff",
+        "font_title": "Microsoft YaHei",
+        "font_body": "Microsoft YaHei"
+      }
+    }
+  }
+}

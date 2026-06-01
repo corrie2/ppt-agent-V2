@@ -1250,7 +1250,7 @@ def test_llm(
 @app.command("serve")
 def serve(
     host: Annotated[str, typer.Option("--host", help="Host interface for the web server.")] = "127.0.0.1",
-    port: Annotated[int, typer.Option("--port", help="Port for the web server.")] = 7860,
+    port: Annotated[int, typer.Option("--port", help="Port for the web server.")] = 7000,
     reload: Annotated[bool, typer.Option("--reload", help="Reload server when source files change.")] = False,
 ) -> None:
     """Start the PPT Agent Studio web UI."""

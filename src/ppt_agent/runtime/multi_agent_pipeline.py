@@ -1348,8 +1348,14 @@ def _llm_or_fallback(
     fallback: Callable[[], dict],
     config: AgentLlmConfig,
 ) -> dict:
+    from ppt_agent.runtime.progress import emit_agent_progress
+    emit_agent_progress(agent_name, "calling LLM...")
     llm_payload = _llm_or_none(agent_name, model, system_prompt=system_prompt, user_payload=user_payload, config=config)
-    return llm_payload if llm_payload is not None else fallback()
+    if llm_payload is not None:
+        emit_agent_progress(agent_name, "LLM completed")
+        return llm_payload
+    emit_agent_progress(agent_name, "using deterministic fallback")
+    return fallback()
 
 
 def _llm_or_none(

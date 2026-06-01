@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from ppt_agent.domain.models import DeckIntent, PptSpec, QaIssue
+from ppt_agent.runtime.progress import emit_agent_progress
 from ppt_agent.utils.state import append_transition, state_get
 
 PLACEHOLDER_PHRASES = {
@@ -16,6 +17,7 @@ PLACEHOLDER_PHRASES = {
 
 
 def qa_node(state: dict[str, Any]) -> dict[str, Any]:
+    emit_agent_progress("QA", "Running quality checks...")
     spec = PptSpec.model_validate(state_get(state, "spec"))
     intent = _intent_from_state(state)
     issues: list[QaIssue] = []

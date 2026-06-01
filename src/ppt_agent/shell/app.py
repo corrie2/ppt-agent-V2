@@ -189,7 +189,17 @@ def _explicit_disabled_user_skill(text: str, session: ShellSession) -> str | Non
 
 
 def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registry: SkillRegistry, output_fn) -> None:
-    if registry.get(skill_call.name).requires_approval:
+    # HIGH: Guard against unknown skill names (Issue 3)
+    if skill_call.name not in registry.names():
+        output_fn(f"Unknown skill: {skill_call.name}")
+        return
+    skill_def = registry.get(skill_call.name)
+
+    # HIGH: Only allow auto_approve for specific skills (Issue 2)
+    AUTO_APPROVE_ALLOWED = {"build_ppt"}
+    auto_approve = skill_call.auto_approve and skill_call.name in AUTO_APPROVE_ALLOWED
+
+    if skill_def.requires_approval and not auto_approve:
         arguments = dict(skill_call.arguments or {})
         if skill_call.name == "build_ppt" and not arguments.get("plan_path"):
             arguments["plan_path"] = session.latest_plan_path
@@ -205,6 +215,11 @@ def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registr
         else:
             output_fn(f"{skill_call.name} is pending approval. Run /approve to continue.")
         return
+
+    # CRITICAL: Fill plan_path for build_ppt even in auto_approve path (Issue 1)
+    if skill_call.name == "build_ppt" and not skill_call.arguments.get("plan_path"):
+        skill_call.arguments = dict(skill_call.arguments)
+        skill_call.arguments["plan_path"] = session.latest_plan_path
 
     if skill_call.name == "generate_plan":
         skill_call.arguments = dict(skill_call.arguments)
@@ -223,7 +238,15 @@ def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registr
         if skill_call.arguments.get("sources"):
             session.selected_sources = list(skill_call.arguments["sources"])
 
-    result = registry.invoke(skill_call.name, **skill_call.arguments)
+    # MEDIUM: Error isolation per skill call (Issue 7)
+    try:
+        result = registry.invoke(skill_call.name, **skill_call.arguments)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("Skill %s failed: %s", skill_call.name, exc, exc_info=True)
+        output_fn(f"Error: {skill_call.name} failed - {exc}")
+        return
+
     session.last_loop_state.last_skill_result = result
     reply = result.get("reply")
     if reply:
@@ -381,7 +404,13 @@ def _advance_draft_to_plan_if_possible(
         output_fn=output_fn,
     )
     output_fn("-> generating plan with evidence...")
-    result = registry.invoke("generate_plan", **arguments)
+    try:
+        result = registry.invoke("generate_plan", **arguments)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("generate_plan failed: %s", exc, exc_info=True)
+        output_fn(f"Error: Plan generation failed - {exc}")
+        return False
     reply = result.get("reply")
     if reply:
         output_fn(reply)
@@ -572,6 +601,7 @@ def _prepare_generate_plan_arguments(
 ) -> dict:
     prepared = registry_safe_arguments(dict(arguments))
     topic = prepared.get("topic") or session.draft_request.topic or session.current_request or "PPT"
+    prepared["topic"] = topic  # Ensure topic is always set
 
     if "retrieve_project_memory" in registry.names():
         output_fn("-> retrieving project memory...")

@@ -5,7 +5,8 @@ import json
 import httpx
 
 from ppt_agent.domain.analysis import PaperAnalysis
-from ppt_agent.llm.planner import PlannerConfigError, _extract_json_object
+from ppt_agent.llm.common import extract_json_object
+from ppt_agent.llm.planner import PlannerConfigError
 from ppt_agent.llm.providers import PROVIDER_SPECS, validate_model
 
 
@@ -15,7 +16,7 @@ def generate_paper_analysis_with_llm(
     provider: str,
     model: str,
     api_key: str,
-    timeout: float = 60.0,
+    timeout: float = 180.0,
 ) -> PaperAnalysis:
     validate_model(provider, model)
     if not api_key.strip():
@@ -71,7 +72,7 @@ def generate_paper_analysis_with_llm(
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
     try:
-        payload = _extract_json_object(content)
+        payload = extract_json_object(content)
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"LLM analyzer response was not valid JSON: {exc}") from exc
     return PaperAnalysis.model_validate(payload)

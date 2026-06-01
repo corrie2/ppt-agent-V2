@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from ppt_agent.domain.models import DeckIntent, PptSpec, SlideSpec
 from ppt_agent.llm.planner import LlmConnectionResult, PlannerConfigError, generate_plan_with_llm, test_llm_connection

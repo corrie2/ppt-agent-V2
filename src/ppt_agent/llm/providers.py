@@ -11,7 +11,7 @@ class ProviderSpec(BaseModel):
 
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
     "deepseek": ProviderSpec(
-        base_url="https://api.deepseek.com",
+        base_url="https://api.deepseek.com/v1",
         models=[
             "deepseek-v4-flash",
             "deepseek-v4-pro",

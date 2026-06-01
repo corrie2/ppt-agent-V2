@@ -60,11 +60,18 @@ def save_api_key(provider: str, api_key: str, cwd: Path | None = None) -> Path:
 
 
 def load_api_key(provider: str, cwd: Path | None = None) -> str | None:
+    import os
+    # Try file first
     path = key_path(provider, cwd)
-    if not path.exists():
-        return None
-    value = path.read_text(encoding="utf-8").strip()
-    return value or None
+    if path.exists():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    # Fallback to environment variable
+    env_key = os.environ.get(f"{provider.upper()}_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if env_key and env_key.strip():
+        return env_key.strip()
+    return None
 
 
 def key_statuses(cwd: Path | None = None) -> list[LlmKeyStatus]:

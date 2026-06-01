@@ -1,4 +1,5 @@
 .venv/
+venv/
 .env
 __pycache__/
 *.py[cod]
@@ -11,9 +12,28 @@ src/**/__pycache__/
 tmp*/
 output/
 *.pptx
+
+# Personal data / API keys
+.ppt-agent/llm/keys/
+.ppt-agent/llm/config.json
+.ppt-agent/memory/
+.ppt-agent/agents/skills.json
 .ppt-agent/data/
 .ppt-agent/ingest/
 .ppt-agent/mineru-*/
-.ppt-agent/llm/config.json
 .ppt-agent/tasks/
-驾驭工程 — 从 Claude Code 源码到 AI 编码最佳实践.pdf
+.ppt-agent/mcp/
+
+# External references
+references/
+
+# Workspace
+workspace/
+
+# PDF files
+*.pdf
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

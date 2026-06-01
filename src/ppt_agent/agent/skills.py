@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from ppt_agent.agent.skill_registry import SkillDefinition
 from ppt_agent.domain.models import AgentMode, AgentState, DeckIntent, PptSpec, SlideSpec
-from ppt_agent.graph.agent import create_agent_graph
+from ppt_agent.graph.agent import create_agent_graph  # noqa: E402
 from ppt_agent.runtime.evidence_ingest import (
     attach_evidence_figures_to_spec,
     ensure_mineru_evidence_for_source,
@@ -27,6 +27,25 @@ from ppt_agent.storage.project_memory import (
 )
 from ppt_agent.shell.session import ShellSession
 from ppt_agent.storage.plan_io import migrate_plan_document, read_plan_document, validate_plan_document, write_plan_document
+
+
+def _sanitize_output_name(name: str) -> str:
+    """Sanitize output_name to prevent path traversal."""
+    import re
+    # Strip path separators and traversal sequences
+    name = name.replace("/", "").replace("\\", "").replace("..", "")
+    # Only allow safe characters
+    name = re.sub(r'[^A-Za-z0-9_.\-]', '_', name)
+    # Ensure non-empty
+    return name or "output"
+
+
+def _emit_progress(session: ShellSession, msg: str):
+    """Emit progress message to session output and console."""
+    prefixed = f"[Progress] {msg}"
+    if session.output_fn:
+        session.output_fn(prefixed)
+    print(prefixed)
 
 
 class ScanWorkspaceInput(BaseModel):
@@ -69,6 +88,10 @@ class MigratePlanInput(BaseModel):
 class BuildPptInput(BaseModel):
     plan_path: str | None = None
     output_path: str | None = None
+
+
+class ParsePdfInput(BaseModel):
+    pdf_path: str
 
 
 class BuildHtmlDeckInput(BaseModel):
@@ -139,6 +162,7 @@ class ListGeneratedFilesInput(BaseModel):
 def register_default_skills(registry, *, session: ShellSession) -> None:
     skill_specs = [
         ("scan_workspace", "Scan the current workspace for source files.", ScanWorkspaceInput, scan_workspace_skill, {"is_read_only": True}),
+        ("parse_pdf", "Parse a PDF with MinerU to extract text and figures.", ParsePdfInput, parse_pdf_skill, {}),
         ("list_sources", "List currently discovered source files.", ListSourcesInput, list_sources_skill, {"is_read_only": True}),
         ("generate_plan", "Generate a PPT plan/spec file.", GeneratePlanInput, generate_plan_skill, {}),
         ("ingest_sources", "Index and digest selected source files into the project source store.", IngestSourcesInput, ingest_sources_skill, {}),
@@ -212,19 +236,58 @@ def register_default_skills(registry, *, session: ShellSession) -> None:
         )
 
 
+def parse_pdf_skill(*, session: ShellSession, pdf_path: str) -> dict[str, Any]:
+    """Parse a PDF with MinerU to extract text and figures. Does not generate a plan."""
+    from ppt_agent.runtime.evidence_ingest import ensure_mineru_evidence_for_source
+
+    _emit_progress(session, f"Parsing PDF with MinerU: {pdf_path}")
+
+    pdf = Path(pdf_path)
+    if not pdf.is_absolute():
+        pdf = session.workspace_dir / pdf_path
+    pdf = pdf.resolve()
+
+    if not pdf.exists():
+        return {"ok": False, "reply": f"PDF not found: {pdf_path}"}
+
+    if pdf.suffix.lower() != ".pdf":
+        return {"ok": False, "reply": f"Not a PDF file: {pdf_path}"}
+
+    pack, evidence_path, warnings = ensure_mineru_evidence_for_source(
+        pdf, workspace=session.workspace_dir,
+    )
+
+    if pack:
+        session.latest_evidence_path = str(evidence_path)
+        session.latest_evidence_warnings = warnings
+        figure_count = len(pack.figures)
+        _emit_progress(session, f"MinerU extraction complete: {figure_count} figures found")
+        return {
+            "ok": True,
+            "reply": f"PDF parsed successfully. Found {figure_count} figures. You can now select which figures to use in the Figure Selection panel.",
+            "evidence_path": str(evidence_path),
+            "figure_count": figure_count,
+            "warnings": warnings,
+        }
+    else:
+        msg = f"MinerU extraction failed. {warnings[0] if warnings else 'Unknown error'}"
+        _emit_progress(session, msg)
+        return {"ok": False, "reply": msg, "warnings": warnings}
+
+
 def scan_workspace_skill(*, session: ShellSession, max_depth: int = 3) -> dict[str, Any]:
     files_by_path: dict[str, dict[str, Any]] = {}
-    for root, depth in ((session.input_dir, max_depth), (session.cwd, 1)):
-        for item in scan_workspace(root, max_depth=depth):
-            data = item.model_dump(mode="json")
-            files_by_path[data["path"]] = data
+    # Only scan workspace folder
+    for item in scan_workspace(session.workspace_dir, max_depth=max_depth):
+        data = item.model_dump(mode="json")
+        files_by_path[data["path"]] = data
     session.discovered_sources = sorted(
         files_by_path.values(),
         key=lambda item: (item["file_type"], item.get("relative_path") or item["name"]),
     )
     return {
         "files": session.discovered_sources,
-        "reply": f"Discovered {len(session.discovered_sources)} source files in {session.input_dir} and project root.",
+        "reply": f"Discovered {len(session.discovered_sources)} source files in {session.workspace_dir}.",
     }
 
 
@@ -253,6 +316,12 @@ def generate_plan_skill(
     project_preferences: list[dict[str, Any]] | None = None,
     failure_patterns: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # Use module-level emit_progress helper
+    def emit_progress(msg: str):
+        _emit_progress(session, msg)
+    
+    emit_progress("Starting plan generation...")
+    
     used_sources = list(sources or session.selected_pdf_paths())
     if used_sources:
         session.selected_sources = list(used_sources)
@@ -271,6 +340,7 @@ def generate_plan_skill(
     resolved_source_digest = source_digest
     resolved_source_context = list(source_context or [])
     if used_sources and resolved_source_digest is None:
+        emit_progress("Preparing evidence pack from PDF...")
         evidence_pack, evidence_path, evidence_warnings = _prepare_evidence_pack(session, used_sources)
         if evidence_warnings:
             session.latest_evidence_warnings = evidence_warnings
@@ -282,15 +352,21 @@ def generate_plan_skill(
         else:
             resolved_source_digest = digest_pdf_sources_skill(session=session, sources=used_sources).get("source_digest")
     if used_sources and not resolved_source_context:
+        emit_progress("Retrieving source context...")
         context_result = retrieve_source_context_skill(session=session, sources=used_sources, query=topic, limit=5)
         resolved_source_context = context_result.get("contexts", [])
     if resolved_source_digest is not None and resolved_source_context:
         resolved_source_digest = {**resolved_source_digest, "retrieved_context": resolved_source_context}
+    # Add user-selected figure IDs as constraint for the planner
+    if session.selected_figure_ids and resolved_source_digest is not None:
+        resolved_source_digest = {**resolved_source_digest, "selected_figure_ids": session.selected_figure_ids}
     project_memory = {"preferences": project_preferences or [], "accepted_outputs": []}
     if project_preferences is None:
+        emit_progress("Retrieving project memory...")
         project_memory = retrieve_project_memory_skill(session=session, query=topic, limit=20)
     failure_memory = {"failure_patterns": failure_patterns or []}
     if failure_patterns is None:
+        emit_progress("Retrieving failure patterns...")
         failure_memory = retrieve_failure_patterns_skill(session=session, query=topic, limit=20)
     session.draft_request.merge(
         {
@@ -309,6 +385,12 @@ def generate_plan_skill(
     )
     graph = create_agent_graph()
     use_assistant_planner = session.assistant_enabled and session.assistant_key_configured()
+    emit_progress("Creating agent graph...")
+    
+    # Set progress callback for agent nodes
+    from ppt_agent.runtime.progress import set_progress_callback
+    set_progress_callback(lambda msg: emit_progress(msg))
+    
     state = AgentState(
         intent=DeckIntent(
             topic=topic,
@@ -327,12 +409,31 @@ def generate_plan_skill(
         planner_model=session.assistant_model if use_assistant_planner else None,
         allow_fallback=not use_assistant_planner,
     )
-    result = graph.invoke(state.model_dump(mode="json"))
+    emit_progress("Running multi-agent pipeline...")
+    try:
+        result = graph.invoke(state.model_dump(mode="json"))
+    finally:
+        set_progress_callback(None)
+    
+    emit_progress("Pipeline completed, validating spec...")
     spec = PptSpec.model_validate(result["spec"])
     evidence_pack_for_render = None
     if resolved_source_digest and resolved_source_digest.get("type") == "evidence_pack":
         evidence_pack_for_render, _, _ = load_evidence_pack(resolved_source_digest.get("path"))
-        spec = attach_evidence_figures_to_spec(spec, evidence_pack_for_render)
+        spec = attach_evidence_figures_to_spec(
+            spec, evidence_pack_for_render,
+            selected_figure_ids=session.selected_figure_ids or None,
+        )
+        # Report figure usage to user
+        used_figures = [
+            (i, fid)
+            for i, slide in enumerate(spec.slides)
+            for fid in slide.content.figure_ids
+        ]
+        if used_figures:
+            emit_progress(f"Figures used: {len(used_figures)} images assigned to slides {[s+1 for s,_ in used_figures]}")
+        elif session.selected_figure_ids:
+            emit_progress(f"Warning: {len(session.selected_figure_ids)} selected figures could not be matched to evidence")
     resolved_audience = audience or spec.audience
     minimum_slides = max(slides or 0, min_slides or 0)
     spec = _normalize_spec(spec, topic=topic, audience=resolved_audience, minimum_slides=minimum_slides)
@@ -397,6 +498,7 @@ def generate_plan_skill(
     session.latest_plan_path = str(target)
     session.latest_plan_sources = used_sources
     session.current_request = topic
+    emit_progress("Generating plan summary...")
     summary = _plan_summary(
         spec,
         used_sources=used_sources,
@@ -505,11 +607,26 @@ def migrate_plan_skill(*, session: ShellSession, input_path: str, output_path: s
 
 
 def build_ppt_skill(*, session: ShellSession, plan_path: str | None = None, output_path: str | None = None) -> dict[str, Any]:
+    # Use module-level emit_progress helper
+    def emit_progress(msg: str):
+        _emit_progress(session, msg)
+    
+    emit_progress("Starting PPT build...")
+    
     target = Path(plan_path or session.latest_plan_path or "")
     document = read_plan_document(target)
-    out = Path(output_path or (session.output_dir / "shell-deck.pptx"))
+    
+    # Use output_name from draft request if available
+    if not output_path and session.draft_request.output_name:
+        safe_name = _sanitize_output_name(session.draft_request.output_name)
+        output_path = str(session.output_dir / f"{safe_name}.pptx")
+    
+    out = Path(output_path or (session.output_dir / f"{_artifact_stem(session, document.spec)}.pptx"))
+    emit_progress("Preparing evidence pack...")
     evidence_pack, evidence_path, evidence_warnings = _evidence_from_plan(document, session=session)
+    emit_progress("Building PPTX...")
     artifact = build_pptx(document.spec, out, evidence_pack=evidence_pack, evidence_path=evidence_path)
+    emit_progress("Evaluating visual quality...")
     visual_report_path = visual_quality_report_path(artifact.path)
     visual_report = evaluate_pptx_visual_quality(document.spec, artifact.path, report_path=visual_report_path)
     session.latest_ppt_path = str(artifact.path)
@@ -547,14 +664,32 @@ def build_html_deck_skill(
     output_path: str | None = None,
     theme: str | None = None,
 ) -> dict[str, Any]:
+    # Use module-level emit_progress helper
+    def emit_progress(msg: str):
+        _emit_progress(session, msg)
+    
+    emit_progress("Starting HTML deck build...")
+    
     target = Path(plan_path or session.latest_plan_path or "")
     document = read_plan_document(target)
+    
+    # Use output_name from draft request if available
+    if not output_path and session.draft_request.output_name:
+        safe_name = _sanitize_output_name(session.draft_request.output_name)
+        output_path = str(session.output_dir / f"{safe_name}.html")
+    
     out = Path(output_path or (session.output_dir / f"{_artifact_stem(session, document.spec)}.html"))
     if session.output_dir.resolve() not in [out.resolve().parent, *out.resolve().parents]:
         raise ValueError("build_html_deck can only write inside the output directory")
+    
+    emit_progress("Loading template and references...")
     template_path = _skill_template_path(session, skill_name or (document.payload.get("applied_skills") or [None])[0])
     references = _skill_reference_paths(session, skill_name or (document.payload.get("applied_skills") or [None])[0])
+    
+    emit_progress("Building HTML deck...")
     html_path = build_html_deck(document.spec, out, template_path=template_path, theme=theme or document.payload.get("theme"), references=references)
+    
+    emit_progress("Validating HTML deck...")
     html_errors = validate_html_deck(
         html_path.read_text(encoding="utf-8"),
         expected_slides=len(document.spec.slides),

@@ -31,6 +31,12 @@ def extract_request_constraints(text: str) -> dict:
         values["applied_skills"] = ["guizang-ppt-skill"]
     if "杂志风" in text or "magazine" in normalized or "editorial" in normalized:
         values["theme"] = "magazine"
+    # Detect style from keywords (academic, modern, minimal, corporate)
+    if "theme" not in values:
+        from ppt_agent.utils import detect_style_from_text
+        detected_style = detect_style_from_text(text)
+        if detected_style:
+            values["theme"] = detected_style
     if _is_exclude_other_sources_confirmation(text):
         values["exclude_other_sources"] = True
     output_name = _extract_output_name(text)
@@ -259,13 +265,9 @@ def _extract_audience(text: str) -> str | None:
 
 
 def _extract_output_name(text: str) -> str | None:
-    for pattern in (
-        r"\u8f93\u51fa\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|是)?\s*([A-Za-z0-9_.-]+)",
-        r"\u6587\u4ef6\u540d(?:\u53eb|\u4e3a|是)?\s*([A-Za-z0-9_.-]+)",
-        r"\u8f93\u51fa(?:\u5230|\u4e3a|叫)?\s*([A-Za-z0-9_.-]+)",
-        r"output(?:\s+file(?:\s+name)?)?\s*(?:is|as|to|called)?\s*([A-Za-z0-9_.-]+)",
-    ):
-        match = re.search(pattern, text, flags=re.IGNORECASE)
+    from ppt_agent.utils import OUTPUT_NAME_PATTERNS
+    for pattern in OUTPUT_NAME_PATTERNS:
+        match = pattern.search(text)
         if match:
             candidate = match.group(1).strip().strip(".")
             if candidate.lower() not in {"ppt", "pptx", "pdf", "html", "file", "deck"}:
