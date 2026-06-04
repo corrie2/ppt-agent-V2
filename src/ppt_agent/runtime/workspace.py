@@ -6,7 +6,8 @@ from pathlib import Path
 from pydantic import BaseModel
 
 
-SUPPORTED_PATTERNS = ("*.pdf", "*.docx", "*.md", "*.json", "*.pptx")
+SUPPORTED_PATTERNS = ("*.pdf", "*.docx", "*.doc", "*.md", "*.txt", "*.markdown", "*.json", "*.pptx")
+SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc", ".md", ".txt", ".markdown", ".json", ".pptx"}
 
 
 class WorkspaceFile(BaseModel):
@@ -55,21 +56,24 @@ def scan_workspace(cwd: Path | None = None, *, max_depth: int = 3) -> list[Works
 
 
 def _is_supported(path: Path) -> bool:
-    suffix = path.suffix.lower()
-    return suffix in {".pdf", ".docx", ".md", ".json", ".pptx"}
+    return path.suffix.lower() in SUPPORTED_SUFFIXES
 
 
 def _read_page_count(path: Path) -> int | None:
+    """Count PDF pages by reading only the last 64KB (where /Count typically lives)."""
     if path.suffix.lower() != ".pdf":
         return None
     try:
-        content = path.read_bytes()
+        file_size = path.stat().st_size
+        read_size = min(file_size, 65536)  # last 64KB
+        with open(path, "rb") as f:
+            f.seek(max(0, file_size - read_size))
+            tail = f.read(read_size)
     except OSError:
         return None
 
-    # Best-effort PDF page counting without adding a new dependency.
     try:
-        count = content.count(b"/Type /Page")
+        count = tail.count(b"/Type /Page")
         return count if count > 0 else None
     except Exception:
         return None

@@ -123,19 +123,21 @@ class PptAgentWebService:
         return {"result": result, "state": self.state(session_id)}
 
     ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".docx", ".doc", ".md", ".txt", ".markdown"}
+    MAX_FILENAME_LENGTH = 200
 
     def upload_files(self, session_id: str, files: list[tuple[str, bytes]]) -> dict[str, Any]:
-        """Upload files to the session's input directory.
+        """Upload files to the session's workspace directory.
 
         Args:
             files: list of (filename, file_bytes) tuples.
         """
         import logging
+        import tempfile
         logger = logging.getLogger(__name__)
 
         web_session = self.sessions.get(session_id)
-        input_dir = web_session.shell.input_dir
-        input_dir.mkdir(parents=True, exist_ok=True)
+        workspace_dir = web_session.shell.workspace_dir
+        workspace_dir.mkdir(parents=True, exist_ok=True)
 
         uploaded = []
         errors = []
@@ -147,24 +149,37 @@ class PptAgentWebService:
                 continue
             # Sanitize filename
             safe_name = Path(filename).name
-            dest = input_dir / safe_name
+            if len(safe_name) > self.MAX_FILENAME_LENGTH:
+                safe_name = safe_name[:self.MAX_FILENAME_LENGTH - len(suffix)] + suffix
+            dest = workspace_dir / safe_name
             # Avoid overwriting - add counter if exists
             if dest.exists():
                 stem = dest.stem
                 counter = 1
                 while dest.exists():
-                    dest = input_dir / f"{stem}_{counter}{suffix}"
+                    dest = workspace_dir / f"{stem}_{counter}{suffix}"
                     counter += 1
-            dest.write_bytes(data)
+            # Atomic write: write to temp file then rename
+            try:
+                fd, tmp_path = tempfile.mkstemp(dir=str(workspace_dir), suffix=suffix)
+                with open(fd, "wb") as f:
+                    f.write(data)
+                Path(tmp_path).rename(dest)
+            except OSError as exc:
+                errors.append(f"{filename}: write failed ({exc})")
+                continue
             uploaded.append({"name": dest.name, "path": str(dest), "size": len(data)})
             logger.info("Uploaded %s (%d bytes) to %s", dest.name, len(data), dest)
 
-        # Auto-scan workspace after upload
+        # Auto-scan workspace after upload (background thread to avoid blocking)
         if uploaded:
-            try:
-                web_session.registry.invoke("scan_workspace", max_depth=3)
-            except Exception as exc:
-                logger.warning("Post-upload scan failed: %s", exc)
+            import threading
+            def _bg_scan():
+                try:
+                    web_session.registry.invoke("scan_workspace", max_depth=3)
+                except Exception as exc:
+                    logger.warning("Post-upload scan failed: %s", exc)
+            threading.Thread(target=_bg_scan, daemon=True).start()
 
         web_session.emit(f"Uploaded {len(uploaded)} file(s): {', '.join(f['name'] for f in uploaded)}")
         return {

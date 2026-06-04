@@ -37,3 +37,10 @@ workspace/
 dist/
 build/
 *.egg-info/
+
+# Personal data files
+*.pptx
+plan.json
+details.md
+*.pdf
+.ppt-agent/jag-mineru/
