@@ -44,6 +44,25 @@ class FigureSelectRequest(BaseModel):
     figure_ids: list[str] = Field(default_factory=list)
 
 
+class TaskApprovalRequest(BaseModel):
+    stage: str = "plan_confirm"
+    note: str = "approved"
+
+
+class TaskContinueRequest(BaseModel):
+    auto_rework: bool = False
+    max_rework: int = Field(default=1, ge=0, le=5)
+
+
+class TaskRejectRequest(BaseModel):
+    stage: str = "plan_confirm"
+    reason: str = Field(default="changes requested", min_length=1)
+
+
+class TaskGateRequest(BaseModel):
+    stage: str = "content"
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="PPT Agent Studio", version="0.1.0")
     service = PptAgentWebService()
@@ -119,6 +138,38 @@ def create_app() -> FastAPI:
     @app.get("/api/sessions/{session_id}/artifacts")
     def artifacts(session_id: str) -> list[dict[str, Any]]:
         return _get_or_404(lambda: service.artifacts(session_id))
+
+    @app.get("/api/sessions/{session_id}/tasks")
+    def harness_tasks(session_id: str) -> list[dict[str, Any]]:
+        return _get_or_404(lambda: service.harness_tasks(session_id))
+
+    @app.get("/api/sessions/{session_id}/tasks/{task_id}")
+    def harness_task(session_id: str, task_id: str) -> dict[str, Any]:
+        return _get_or_404(lambda: service.harness_task(session_id, task_id))
+
+    @app.get("/api/sessions/{session_id}/tasks/{task_id}/events")
+    def harness_task_events(session_id: str, task_id: str, limit: int = Query(default=50, ge=1, le=500)) -> list[dict[str, Any]]:
+        return _get_or_404(lambda: service.harness_task_events(session_id, task_id, limit=limit))
+
+    @app.get("/api/sessions/{session_id}/tasks/{task_id}/artifacts")
+    def harness_task_artifacts(session_id: str, task_id: str) -> list[dict[str, Any]]:
+        return _get_or_404(lambda: service.harness_task_artifacts(session_id, task_id))
+
+    @app.post("/api/sessions/{session_id}/tasks/{task_id}/continue")
+    def harness_task_continue(session_id: str, task_id: str, request: TaskContinueRequest = TaskContinueRequest()) -> dict[str, Any]:
+        return _get_or_404(lambda: service.harness_task_continue(session_id, task_id, auto_rework=request.auto_rework, max_rework=request.max_rework))
+
+    @app.post("/api/sessions/{session_id}/tasks/{task_id}/approve")
+    def harness_task_approve(session_id: str, task_id: str, request: TaskApprovalRequest) -> dict[str, Any]:
+        return _get_or_404(lambda: service.harness_task_approve(session_id, task_id, stage=request.stage, note=request.note))
+
+    @app.post("/api/sessions/{session_id}/tasks/{task_id}/reject")
+    def harness_task_reject(session_id: str, task_id: str, request: TaskRejectRequest) -> dict[str, Any]:
+        return _get_or_404(lambda: service.harness_task_reject(session_id, task_id, stage=request.stage, reason=request.reason))
+
+    @app.post("/api/sessions/{session_id}/tasks/{task_id}/gates")
+    def harness_task_gates(session_id: str, task_id: str, request: TaskGateRequest) -> dict[str, Any]:
+        return _get_or_404(lambda: service.harness_task_gates(session_id, task_id, stage=request.stage))
 
     @app.get("/api/sessions/{session_id}/artifact")
     def artifact(session_id: str, path: str = Query(...)) -> FileResponse:
@@ -367,64 +418,65 @@ INDEX_HTML = r"""<!doctype html>
       overflow: auto;
       border-top: 1px solid var(--line);
       padding: 16px;
-      background: #27231f;
-      color: #eee8dc;
+      background: #f1eee8;
+      color: #2f2a24;
       font-family: var(--mono);
       font-size: 12px;
       white-space: pre-wrap;
     }
     
     .event-progress {
-      color: #63b3ed;
+      color: #315f70;
       padding: 4px 0;
-      border-left: 3px solid #3182ce;
+      border-left: 3px solid #6f9fb0;
       padding-left: 8px;
       margin: 4px 0;
+      background: rgba(111, 159, 176, .08);
     }
     
     .agent-planner {
-      color: #fbd38d;
-      border-left-color: #d69e2e;
+      color: #7b5b19;
+      border-left-color: #c9a24e;
     }
     
     .agent-content {
-      color: #9ae6b4;
-      border-left-color: #38a169;
+      color: #2f6b4f;
+      border-left-color: #6aa986;
     }
     
     .agent-design {
-      color: #d6bcfa;
-      border-left-color: #805ad5;
+      color: #67558a;
+      border-left-color: #9b88bf;
     }
     
     .agent-qa {
-      color: #fed7d7;
-      border-left-color: #e53e3e;
+      color: #8b3f36;
+      border-left-color: #c07165;
     }
     
     .agent-builder {
-      color: #fefcbf;
-      border-left-color: #d69e2e;
+      color: #6f5b1b;
+      border-left-color: #b99d48;
     }
     
     .event-user {
-      color: #68d391;
+      color: #245d47;
       padding: 4px 0;
       font-weight: bold;
     }
     
     .event-agent {
-      color: #fc8181;
+      color: #704236;
       padding: 4px 0;
     }
     
     .event-default {
-      color: #eee8dc;
+      color: #3a332b;
       padding: 4px 0;
     }
     
     .event-empty {
-      color: #718096;
+      color: var(--subtle);
       font-style: italic;
     }
     .item {
@@ -512,10 +564,11 @@ INDEX_HTML = r"""<!doctype html>
       padding: 16px;
       overflow: auto;
       height: 100%;
-      background: #211d19;
-      color: #f2eadf;
+      background: #f1eee8;
+      color: #2f2a24;
       font-family: var(--mono);
       font-size: 12px;
+      border-top: 1px solid var(--line);
     }
     .preview-tabs {
       display: flex;
@@ -890,6 +943,31 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderPipeline() {
       const pending = state.pending_action ? state.pending_action.description : "none";
+      const tasks = state.harness_tasks || [];
+      const taskHtml = tasks.length ? tasks.slice(0, 3).map(task => {
+        const total = task.total_stages || 0;
+        const done = task.completed_stages || 0;
+        const pct = total ? Math.round((done / total) * 100) : 0;
+        const detailHref = `/api/sessions/${state.session_id}/tasks/${encodeURIComponent(task.task_id)}`;
+        const waiting = task.status === "waiting_approval";
+        const stage = task.current_stage || "plan_confirm";
+        const controls = waiting ? `
+            <div class="row" style="margin-top:8px">
+              <button class="good harness-action" data-action="approve" data-task="${escapeAttr(task.task_id)}" data-stage="${escapeAttr(stage)}">Approve</button>
+              <button class="harness-action" data-action="reject" data-task="${escapeAttr(task.task_id)}" data-stage="${escapeAttr(stage)}">Request changes</button>
+            </div>` : `
+            <div class="row" style="margin-top:8px">
+              <button class="harness-action" data-action="continue" data-task="${escapeAttr(task.task_id)}">Continue</button>
+            </div>`;
+        return `
+          <div class="item">
+            <strong>${escapeHtml(task.title || task.topic || task.task_id)}</strong>
+            <small>status: ${escapeHtml(task.status || "unknown")} | stages: ${done}/${total} (${pct}%)</small><br>
+            <small>current: ${escapeHtml(task.current_stage || "none")}</small><br>
+            <small><a class="artifact-link" target="_blank" href="${detailHref}">manifest</a></small>
+            ${controls}
+          </div>`;
+      }).join("") : `<div class="item"><small>No Harness task runs yet.</small></div>`;
       document.getElementById("pipeline").innerHTML = `
         <div class="item">
           <strong>Pipeline</strong>
@@ -897,7 +975,8 @@ INDEX_HTML = r"""<!doctype html>
           <small>evidence: ${escapeHtml(state.latest_evidence_path || "none")}</small><br>
           <small>build: ${escapeHtml(state.last_build_status || "none")}</small><br>
           <small>pending: ${escapeHtml(pending)}</small>
-        </div>`;
+        </div>
+        ${taskHtml}`;
     }
 
     function renderArtifacts() {
@@ -1406,6 +1485,44 @@ INDEX_HTML = r"""<!doctype html>
       }
       uploadBtn.disabled = false;
     });
+
+    document.getElementById("pipeline").addEventListener("click", async (event) => {
+      const button = event.target.closest(".harness-action");
+      if (!button) return;
+      const taskId = button.dataset.task;
+      const action = button.dataset.action;
+      const stage = button.dataset.stage || "plan_confirm";
+      try {
+        let result;
+        if (action === "approve") {
+          result = await api(`/api/sessions/${state.session_id}/tasks/${encodeURIComponent(taskId)}/approve`, {
+            method: "POST",
+            body: JSON.stringify({ stage, note: "approved in Studio" })
+          });
+        } else if (action === "reject") {
+          const reason = prompt("Change request", "Please revise this stage.");
+          if (!reason) return;
+          result = await api(`/api/sessions/${state.session_id}/tasks/${encodeURIComponent(taskId)}/reject`, {
+            method: "POST",
+            body: JSON.stringify({ stage, reason })
+          });
+        } else {
+          result = await api(`/api/sessions/${state.session_id}/tasks/${encodeURIComponent(taskId)}/continue`, {
+            method: "POST",
+            body: JSON.stringify({})
+          });
+        }
+        state = result.state;
+        if (result.action && result.action.message) {
+          chatHistory.push(`PPT Agent: ${result.action.message}`);
+        }
+        render();
+      } catch (error) {
+        chatHistory.push(`PPT Agent: Harness action failed: ${error.message}`);
+        render();
+      }
+    });
+
     document.getElementById("sendBtn").addEventListener("click", async () => {
       if (isSending) return;  // 防止重复发送
       

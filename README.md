@@ -9,6 +9,7 @@ Chinese documentation: [README.zh.md](README.zh.md)
 ## Architecture
 
 - `runtime/multi_agent_pipeline.py`: Multi-agent LangGraph deck planning pipeline; each Agent is represented as a graph node.
+- `runtime/harness/`: Task manifest, stage archive, event log, quality gate, and resume metadata for Harness-style runs.
 - `runtime/renderer_engineer.py`: Renderer Engineer Agent logic, renderer-code context extraction, extension planning, and task-local helper script output.
 - `runtime/visual_quality.py`: Visual Quality Evaluator for post-build PPTX metrics, LLM visual assessment, and `.visual_quality_report.json` output.
 - `runtime/agent_llm.py`: Per-agent provider/model routing and JSON-only LLM calls.
@@ -34,7 +35,9 @@ Useful commands:
 ppt-agent plan "Quarterly product roadmap" --spec plan.json
 ppt-agent build plan.json --out deck.pptx
 ppt-agent run "Quarterly product roadmap" --mode plan
+ppt-agent run "Teach Transformer attention" --skill-template course-teaching-deck --out deck.pptx
 ppt-agent serve
+ppt-agent task list
 ```
 
 For normal non-evidence decks, the default `plan` / `run` path uses the multi-agent pipeline.
@@ -69,6 +72,7 @@ PPT Agent Studio is a local visual workbench. It reuses the same `ShellSession`,
 - plan JSON preview
 - generated artifact list with local artifact links
 - event log for agent and skill progress
+- Harness task progress, including current stage, completed stage count, and manifest links
 
 The web UI does not replace the CLI. Both entrypoints should share behavior through the service layer so planning, skill use, QA, and build logic do not drift.
 
@@ -84,8 +88,7 @@ DeckIntent
   -> brief_outline node creates brief.json and outline.json
   -> brief_outline_eval node evaluates brief and outline
   -> content node creates content.json
-     || design_chart node creates design_chart.json
-  -> join waits for content.json and design_chart.json
+  -> design_chart node creates design_chart.json
   -> content_eval node evaluates content
   -> design_chart_eval node evaluates design and chart output
   -> supervisor_merge node creates slides_ir.json
@@ -120,8 +123,17 @@ Each run writes artifacts under:
 
 ```text
 .ppt-agent/tasks/{task_id}/
+  manifest.json
   input/
     user_request.json
+  logs/
+    events.jsonl
+  stages/
+    {order}_{stage_id}/
+      input.json
+      output.json
+      eval.json
+      status.json
   intermediate/
     brief.json
     outline.json
@@ -135,12 +147,57 @@ Each run writes artifacts under:
     renderer_engineer_report.json
     renderer_scripts/
     render_review_report.json
+    ppt_spec.json
   task_plan.json
 ```
 
-The default page count is `15`. Each Agent is a LangGraph node. Workers collaborate through JSON artifacts and do not mutate each other's outputs.
+The default page count is `15`. Each Agent is a LangGraph node. Workers collaborate through JSON artifacts and do not mutate each other's outputs. The Harness archive keeps per-stage input, output, evaluation, status, event, and resume metadata so a later UI or CLI command can inspect progress and continue from existing intermediate artifacts.
 
 Evaluator sidecar nodes run immediately after key artifacts are produced. Rule checks run first; the LLM Evaluator is called only when rule checks find warning/error conditions. A stage is sent back to the responsible node when the evaluation has `severity = error`, `requires_rework = true`, or `score < 0.75`. Each evaluation stage can trigger at most one local rework attempt.
+
+## Harness Tasks And Recovery
+
+Harness task commands inspect and manage archived multi-agent runs under `.ppt-agent/tasks/`:
+
+```bash
+ppt-agent task list
+ppt-agent task inspect <task-id-or-path>
+ppt-agent task events <task-id-or-path> --limit 50
+ppt-agent task artifacts <task-id-or-path>
+ppt-agent task continue <task-id-or-path>
+ppt-agent task continue <task-id-or-path> --auto-rework --max-rework 1
+ppt-agent task approve <task-id-or-path> --stage plan_confirm --note "approved"
+ppt-agent task reject <task-id-or-path> --stage plan_confirm --reason "revise outline"
+ppt-agent task gates <task-id-or-path> --stage content
+ppt-agent task preview <task-id-or-path>
+ppt-agent task resume <task-id-or-path> --out resumed_plan.json
+ppt-agent task retry-stage <task-id-or-path> content --reason "update required"
+```
+
+Key behaviors:
+
+- `manifest.json` records task status, current stage, stage outputs, reports, final `ppt_spec`, and resume hints.
+- `logs/events.jsonl` records stage-level progress events for process views.
+- Stage folders keep `input.json`, `output.json`, `eval.json`, and `status.json` snapshots.
+- Quality gates run deterministic checks before expensive LLM evaluation where possible.
+- Confirmation stages (`plan_confirm`, `build_confirm`) can pause the task until a user approves or requests changes.
+- Page preview writes lightweight per-slide JSON and HTML previews under `previews/` from the archived `ppt_spec`.
+- `retry-stage` followed by `continue` can regenerate `content` and downstream stages from archived `brief_outline` artifacts. It reuses the existing LLM-capable pipeline nodes when agent LLM config is enabled, and falls back deterministically when LLM calls are unavailable.
+- `--auto-rework` enables bounded quality-gate retry attempts; manual review remains the default.
+- `resume` exports the latest archived `ppt_spec` back into a normal plan file for build or review.
+
+Studio exposes the same data through read-only task APIs:
+
+```text
+GET /api/sessions/{session_id}/tasks
+GET /api/sessions/{session_id}/tasks/{task_id}
+GET /api/sessions/{session_id}/tasks/{task_id}/events
+GET /api/sessions/{session_id}/tasks/{task_id}/artifacts
+POST /api/sessions/{session_id}/tasks/{task_id}/continue
+POST /api/sessions/{session_id}/tasks/{task_id}/approve
+POST /api/sessions/{session_id}/tasks/{task_id}/reject
+POST /api/sessions/{session_id}/tasks/{task_id}/gates
+```
 
 ## Agent Model Routing
 
@@ -195,7 +252,20 @@ Common skill commands:
 ppt-agent skill add <path-or-git-url>
 ppt-agent skill list
 ppt-agent skill validate <path-or-name>
+ppt-agent skill init-template academic-paper-deck
+ppt-agent skill init-template course-teaching-deck
+ppt-agent skill init-template business-report-deck
+ppt-agent skill init-template deck-quality-gate
 ```
+
+Use a template during planning or running:
+
+```bash
+ppt-agent plan "Explain retrieval augmented generation" --skill-template course-teaching-deck --spec plan.json
+ppt-agent run "Board-level AI adoption report" --skill-template business-report-deck --out output/report.pptx
+```
+
+If the template skill does not exist yet, PPT Agent creates it under `.ppt-agent/skills/` and adds its skill name to `DeckIntent.applied_skills`, so the Supervisor can route it to the relevant worker agents.
 
 Multi-agent skill policy:
 
@@ -216,6 +286,18 @@ You can restrict a skill to specific agents by adding `agent_scope` to `skill.js
   "description": "Executive-ready slide writing guidance.",
   "type": "markdown",
   "agent_scope": ["content", "qa"]
+}
+```
+
+Skill manifests can also describe v2 governance metadata:
+
+```json
+{
+  "applies_to": ["paper", "course", "business"],
+  "quality_gates": ["citation_required_when_evidence", "max_bullets_per_slide"],
+  "artifacts": {"qa_rules": "qa_rules.json"},
+  "examples": ["examples/request.json"],
+  "version": "2.0.0"
 }
 ```
 
@@ -241,6 +323,16 @@ Example:
 ```
 
 Each run writes the resolved `skill_policy`, `skill_catalog`, and `skill_assignments` into that task's `task_plan.json`.
+
+## Feedback Capture
+
+Use feedback commands to preserve accepted outputs, project preferences, corrections, and failure patterns for later planning or review:
+
+```bash
+ppt-agent feedback add "Prefer page-level preview before full PPTX build" --type preference
+ppt-agent feedback add "Content stage missed citations" --type failure --task <task-id> --stage content
+ppt-agent feedback accept <task-id> --note "Approved as final sales deck style"
+```
 
 ## Document-to-Deck
 

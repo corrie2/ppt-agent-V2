@@ -20,6 +20,9 @@ from ppt_agent.runtime.renderer_engineer import (
     validate_renderer_engineer_report,
     write_renderer_scripts,
 )
+from ppt_agent.runtime.harness import append_event, create_manifest, run_quality_gates, update_stage
+from ppt_agent.runtime.harness.artifacts import copy_artifact, stage_dir, write_json as write_harness_json
+from ppt_agent.runtime.harness.manifest import STAGE_ORDER, save_manifest
 
 DEFAULT_PAGE_COUNT = 15
 MAX_VISIBLE_BULLETS = 3
@@ -268,6 +271,17 @@ def build_multi_agent_plan_spec(
         [issue.message for evaluation in evaluation_report.evaluations for issue in evaluation.issues],
     )
     _write_json(Path(artifacts["task_plan"]), _task_plan_payload(intent, stages, artifacts, skill_assignments))
+    artifacts["ppt_spec"] = str(build_dir / "ppt_spec.json")
+    _write_json(Path(artifacts["ppt_spec"]), spec.model_dump(mode="json"))
+    _write_harness_archive(
+        intent=intent,
+        task_dir=task_dir,
+        artifacts=artifacts,
+        stage_statuses=stages,
+        final_state=final_state,
+        spec=spec,
+        skill_assignments=skill_assignments,
+    )
 
     return PipelineResult(spec=spec, task_dir=task_dir, artifacts=artifacts)
 
@@ -299,9 +313,10 @@ def create_multi_agent_graph():
     graph.add_conditional_edges(
         "brief_outline_eval",
         _after_brief_outline_eval,
-        {"brief_outline": "brief_outline", "content": "content", "design_chart": "design_chart"},
+        {"brief_outline": "brief_outline", "content": "content"},
     )
-    graph.add_edge(["content", "design_chart"], "content_eval")
+    graph.add_edge("content", "design_chart")
+    graph.add_edge("design_chart", "content_eval")
     graph.add_edge("content_rework", "content_eval")
     graph.add_conditional_edges(
         "content_eval",
@@ -341,7 +356,7 @@ def create_multi_agent_graph():
 def supervisor_start_node(state: dict[str, Any]) -> dict[str, Any]:
     intent = DeckIntent.model_validate(state["intent"])
     user_request = _user_request(intent)
-    return {"user_request": user_request, "transitions": [*state.get("transitions", []), "supervisor_start"]}
+    return _state_update(state, user_request=user_request, transitions=[*state.get("transitions", []), "supervisor_start"])
 
 
 def brief_outline_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -370,7 +385,7 @@ def brief_outline_node(state: dict[str, Any]) -> dict[str, Any]:
         fallback=lambda: _brief_outline_agent(brief),
         config=config,
     )
-    return {"brief": brief, "outline": outline, "transitions": [*state.get("transitions", []), "brief_outline"]}
+    return _state_update(state, brief=brief, outline=outline, transitions=[*state.get("transitions", []), "brief_outline"])
 
 
 def brief_outline_eval_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -401,7 +416,7 @@ def content_node(state: dict[str, Any]) -> dict[str, Any]:
         fallback=lambda: _content_agent(brief, outline),
         config=config,
     )
-    return {"content": content}
+    return _state_update(state, content=content)
 
 
 def design_chart_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -421,7 +436,7 @@ def design_chart_node(state: dict[str, Any]) -> dict[str, Any]:
         fallback=lambda: _design_chart_agent(brief, outline),
         config=config,
     )
-    return {"design_chart": design_chart}
+    return _state_update(state, design_chart=design_chart)
 
 
 def content_eval_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -469,7 +484,7 @@ def supervisor_merge_node(state: dict[str, Any]) -> dict[str, Any]:
         config=config,
     )
     slides_ir["task_dir"] = state["task_dir"]
-    return {"slides_ir": slides_ir, "transitions": [*state.get("transitions", []), "supervisor_merge"]}
+    return _state_update(state, slides_ir=slides_ir, transitions=[*state.get("transitions", []), "supervisor_merge"])
 
 
 def slides_ir_eval_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -485,7 +500,7 @@ def slides_ir_eval_node(state: dict[str, Any]) -> dict[str, Any]:
 
 def qa_node(state: dict[str, Any]) -> dict[str, Any]:
     report = _qa_agent_with_llm(state["slides_ir"], state["llm_config"], state["skill_assignments"])
-    return {"review_report": report.model_dump(mode="json"), "transitions": [*state.get("transitions", []), "qa"]}
+    return _state_update(state, review_report=report.model_dump(mode="json"), transitions=[*state.get("transitions", []), "qa"])
 
 
 def supervisor_repair_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -497,7 +512,7 @@ def supervisor_repair_node(state: dict[str, Any]) -> dict[str, Any]:
         state["skill_assignments"],
     )
     slides_ir["task_dir"] = state["task_dir"]
-    return {"slides_ir": slides_ir, "transitions": [*state.get("transitions", []), "supervisor_repair"]}
+    return _state_update(state, slides_ir=slides_ir, transitions=[*state.get("transitions", []), "supervisor_repair"])
 
 
 def page_designer_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -506,7 +521,7 @@ def page_designer_node(state: dict[str, Any]) -> dict[str, Any]:
         state["llm_config"],
         state["skill_assignments"],
     )
-    return {"page_design": page_design, "transitions": [*state.get("transitions", []), "page_designer"]}
+    return _state_update(state, page_design=page_design, transitions=[*state.get("transitions", []), "page_designer"])
 
 
 def renderer_engineer_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -516,7 +531,7 @@ def renderer_engineer_node(state: dict[str, Any]) -> dict[str, Any]:
         state["llm_config"],
         state["skill_assignments"],
     )
-    return {"renderer_engineer_report": report, "transitions": [*state.get("transitions", []), "renderer_engineer"]}
+    return _state_update(state, renderer_engineer_report=report, transitions=[*state.get("transitions", []), "renderer_engineer"])
 
 
 def page_generator_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -525,7 +540,7 @@ def page_generator_node(state: dict[str, Any]) -> dict[str, Any]:
         DeckIntent.model_validate(state["intent"]),
         page_design=state.get("page_design"),
     )
-    return {"spec": spec.model_dump(mode="json"), "transitions": [*state.get("transitions", []), "page_generator"]}
+    return _state_update(state, spec=spec.model_dump(mode="json"), transitions=[*state.get("transitions", []), "page_generator"])
 
 
 def render_review_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -537,7 +552,7 @@ def render_review_node(state: dict[str, Any]) -> dict[str, Any]:
         state["llm_config"],
         state["skill_assignments"],
     )
-    return {"render_review_report": report.model_dump(mode="json"), "transitions": [*state.get("transitions", []), "render_review"]}
+    return _state_update(state, render_review_report=report.model_dump(mode="json"), transitions=[*state.get("transitions", []), "render_review"])
 
 
 def final_eval_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -563,8 +578,8 @@ def _after_multi_agent_qa(state: dict[str, Any]) -> str:
     return "page_designer" if report.ok else "supervisor_repair"
 
 
-def _after_brief_outline_eval(state: dict[str, Any]) -> str | list[str]:
-    return "brief_outline" if _should_rework(state, "brief_outline_eval") else ["content", "design_chart"]
+def _after_brief_outline_eval(state: dict[str, Any]) -> str:
+    return "brief_outline" if _should_rework(state, "brief_outline_eval") else "content"
 
 
 def _after_content_eval(state: dict[str, Any]) -> str:
@@ -634,12 +649,19 @@ def _append_evaluation_update(state: dict[str, Any], evaluation: StageEvaluation
         requires_rework=requires_rework,
         evaluations=evaluations,
     )
-    return {
-        "evaluation_report": updated_report.model_dump(mode="json"),
-        "rework_counts": counts,
-        "rework_decisions": rework_decisions,
-        "transitions": [*state.get("transitions", []), evaluation.stage],
-    }
+    return _state_update(
+        state,
+        evaluation_report=updated_report.model_dump(mode="json"),
+        rework_counts=counts,
+        rework_decisions=rework_decisions,
+        transitions=[*state.get("transitions", []), evaluation.stage],
+    )
+
+
+def _state_update(state: dict[str, Any], **updates: Any) -> dict[str, Any]:
+    merged = dict(state)
+    merged.update(updates)
+    return merged
 
 
 def _should_rework(state: dict[str, Any], stage: str) -> bool:
@@ -1822,6 +1844,189 @@ def _task_id(topic: str) -> str:
     slug = slug or "deck"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     return f"{timestamp}-{slug}-{uuid4().hex[:8]}"
+
+
+def _write_harness_archive(
+    *,
+    intent: DeckIntent,
+    task_dir: Path,
+    artifacts: dict[str, str],
+    stage_statuses: list[PipelineStageStatus],
+    final_state: dict[str, Any],
+    spec: PptSpec,
+    skill_assignments: AgentSkillAssignments,
+) -> None:
+    manifest = create_manifest(
+        task_dir,
+        task_id=task_dir.name,
+        topic=intent.topic,
+        metadata={
+            "harness_version": 1,
+            "pipeline": "multi_agent",
+            "skill_assignments": skill_assignments.names_by_agent(),
+        },
+    )
+    manifest.input = {
+        "request_path": "input/request.json",
+        "legacy_user_request_path": _relative_to_task(task_dir, Path(artifacts["user_request"])),
+        "source_digest_present": intent.source_digest is not None,
+        "source_context_count": len(intent.source_context),
+    }
+    append_event(task_dir, "task_started", payload={"topic": intent.topic, "pipeline": "multi_agent"})
+
+    old_status_by_stage = {stage.name: stage for stage in stage_statuses}
+    stage_payloads = {
+        "request": final_state.get("user_request") or _user_request(intent),
+        "source_ingest": intent.source_digest or {"source_context": intent.source_context, "skipped": True},
+        "brief_outline": {"brief": final_state.get("brief"), "outline": final_state.get("outline")},
+        "plan_confirm": {"waiting_for": "human approval", "requires": ["brief_outline"], "summary": "Approve the plan before downstream generation."},
+        "content": final_state.get("content"),
+        "design_chart": final_state.get("design_chart"),
+        "slides_ir": final_state.get("slides_ir"),
+        "qa": final_state.get("review_report"),
+        "repair": final_state.get("slides_ir"),
+        "page_design": final_state.get("page_design"),
+        "page_preview": {"pending": True, "reason": "HarnessRunner writes page previews from ppt_spec."},
+        "renderer_engineer": final_state.get("renderer_engineer_report"),
+        "page_generator": spec.model_dump(mode="json"),
+        "render_review": final_state.get("render_review_report"),
+        "build_confirm": {"waiting_for": "human approval", "requires": ["page_preview", "render_review"], "summary": "Approve before PPTX build."},
+        "pptx_build": {"skipped": True, "reason": "plan pipeline does not build PPTX"},
+        "visual_quality": {"skipped": True, "reason": "visual quality runs after PPTX build"},
+    }
+    legacy_artifacts = {
+        "request": artifacts.get("user_request"),
+        "brief_outline": artifacts.get("outline"),
+        "content": artifacts.get("content"),
+        "design_chart": artifacts.get("design_chart"),
+        "slides_ir": artifacts.get("slides_ir"),
+        "qa": artifacts.get("review_report"),
+        "page_design": artifacts.get("page_design"),
+        "renderer_engineer": artifacts.get("renderer_engineer_report"),
+        "page_generator": artifacts.get("ppt_spec"),
+        "render_review": artifacts.get("render_review_report"),
+    }
+    skipped = {"source_ingest", "pptx_build", "visual_quality"}
+    if "supervisor_repair" not in final_state.get("transitions", []):
+        skipped.add("repair")
+
+    for order, stage_id in enumerate(STAGE_ORDER, start=1):
+        directory = stage_dir(task_dir, order, stage_id)
+        input_path = write_harness_json(
+            directory / "input.json",
+            {
+                "stage_id": stage_id,
+                "topic": intent.topic,
+                "requires": _stage_requires(stage_id),
+                "source_digest_present": intent.source_digest is not None,
+            },
+        )
+        payload = stage_payloads.get(stage_id) or {}
+        output_path = write_harness_json(directory / "output.json", payload)
+        if legacy_artifacts.get(stage_id):
+            copy_artifact(Path(legacy_artifacts[stage_id]), directory / f"legacy_{Path(legacy_artifacts[stage_id]).name}")
+        gate = run_quality_gates(
+            stage_id,
+            payload,
+            context={"evidence_required": intent.source_digest is not None},
+        )
+        old_status = _legacy_status_for_harness(stage_id, old_status_by_stage)
+        if stage_id in {"plan_confirm", "build_confirm"}:
+            status = "waiting_approval"
+        elif stage_id == "page_preview":
+            status = "pending"
+        else:
+            status = "skipped" if stage_id in skipped else _gate_to_stage_status(gate.status, old_status)
+        status_payload = {
+            "stage_id": stage_id,
+            "status": status,
+            "legacy_status": old_status,
+            "next_action": gate.next_action,
+        }
+        eval_path = write_harness_json(directory / "eval.json", gate.model_dump(mode="json"))
+        status_path = write_harness_json(directory / "status.json", status_payload)
+        update_stage(
+            task_dir,
+            manifest,
+            stage_id,
+            status=status,
+            input_path=str(input_path),
+            output_path=str(output_path),
+            eval_path=str(eval_path),
+            status_path=str(status_path),
+            issues=[issue.model_dump(mode="json") for issue in gate.issues],
+            metrics=gate.metrics,
+        )
+        append_event(
+            task_dir,
+            "stage_recorded",
+            stage_id=stage_id,
+            payload={"status": status, "score": gate.score, "issues": len(gate.issues)},
+        )
+
+    manifest.outputs["ppt_spec"] = _relative_to_task(task_dir, Path(artifacts["ppt_spec"]))
+    manifest.reports["task_plan"] = _relative_to_task(task_dir, Path(artifacts["task_plan"]))
+    manifest.reports["qa_report"] = _relative_to_task(task_dir, Path(artifacts["review_report"]))
+    manifest.reports["evaluation_report"] = _relative_to_task(task_dir, Path(artifacts["evaluation_report"]))
+    manifest.reports["render_review_report"] = _relative_to_task(task_dir, Path(artifacts["render_review_report"]))
+    append_event(task_dir, "task_completed", payload={"status": manifest.status, "outputs": manifest.outputs})
+    save_manifest(task_dir, manifest)
+
+
+def _stage_requires(stage_id: str) -> list[str]:
+    mapping = {
+        "request": [],
+        "source_ingest": ["request"],
+        "brief_outline": ["request", "source_ingest"],
+        "plan_confirm": ["brief_outline"],
+        "content": ["brief_outline"],
+        "design_chart": ["brief_outline"],
+        "slides_ir": ["content", "design_chart"],
+        "qa": ["slides_ir"],
+        "repair": ["qa"],
+        "page_design": ["slides_ir", "repair"],
+        "page_preview": ["page_design", "page_generator"],
+        "renderer_engineer": ["page_design"],
+        "page_generator": ["slides_ir", "page_design", "renderer_engineer"],
+        "render_review": ["page_generator"],
+        "build_confirm": ["page_preview", "render_review"],
+        "pptx_build": ["build_confirm", "page_generator", "render_review"],
+        "visual_quality": ["pptx_build"],
+    }
+    return mapping.get(stage_id, [])
+
+
+def _legacy_status_for_harness(stage_id: str, statuses: dict[str, PipelineStageStatus]) -> str | None:
+    mapping = {
+        "request": "user_request",
+        "brief_outline": "brief_outline",
+        "content": "content",
+        "design_chart": "design_chart",
+        "slides_ir": "supervisor",
+        "qa": "qa",
+        "page_design": "page_designer",
+        "renderer_engineer": "renderer_engineer",
+        "render_review": "render_review",
+    }
+    legacy = statuses.get(mapping.get(stage_id, stage_id))
+    return legacy.status if legacy else None
+
+
+def _gate_to_stage_status(gate_status: str, legacy_status: str | None) -> str:
+    if gate_status == "failed":
+        return "failed"
+    if gate_status == "needs_rework":
+        return "needs_rework"
+    if legacy_status == "failed":
+        return "failed"
+    return "passed"
+
+
+def _relative_to_task(task_dir: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(task_dir.resolve()))
+    except ValueError:
+        return str(path)
 
 
 def _write_json(path: Path, payload: dict) -> None:

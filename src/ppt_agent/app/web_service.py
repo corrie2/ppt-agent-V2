@@ -11,6 +11,9 @@ from ppt_agent.agent.skill_registry import SkillRegistry
 from ppt_agent.agent.skills import register_default_skills
 from ppt_agent.agent.user_skills import reload_user_skills
 from ppt_agent.runtime.agent_skills import assign_skills_to_agents
+from ppt_agent.runtime.harness.events import read_events
+from ppt_agent.runtime.harness.manifest import HarnessManifest, load_manifest, task_root
+from ppt_agent.runtime.harness.runner import HarnessRunner
 from ppt_agent.shell.app import (
     _execute_skill_call,
     _merge_draft_into_generate_plan_arguments,
@@ -113,6 +116,7 @@ class PptAgentWebService:
             "agent_skill_assignments": _agent_skill_assignments_payload(shell),
             "events": list(web_session.events),
             "artifacts": self.artifacts(session_id),
+            "harness_tasks": self.harness_tasks(session_id),
         }
 
     def scan_workspace(self, session_id: str, *, max_depth: int = 3) -> dict[str, Any]:
@@ -342,6 +346,127 @@ class PptAgentWebService:
                 }
             )
         return artifacts[:50]
+
+    def harness_tasks(self, session_id: str) -> list[dict[str, Any]]:
+        """List archived multi-agent task runs for the current workspace."""
+        shell = self.sessions.get(session_id).shell
+        root = task_root(shell.cwd)
+        if not root.exists():
+            return []
+        tasks: list[dict[str, Any]] = []
+        for path in sorted(root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
+            if not path.is_dir() or not (path / "manifest.json").exists():
+                continue
+            try:
+                manifest = load_manifest(path)
+            except Exception:
+                continue
+            payload = self._harness_manifest_summary(path, manifest)
+            payload["modified_time"] = path.stat().st_mtime
+            tasks.append(payload)
+        return tasks[:100]
+
+    def harness_task(self, session_id: str, task_id: str) -> dict[str, Any]:
+        task_dir = self._harness_task_dir(session_id, task_id)
+        manifest = load_manifest(task_dir)
+        payload = self._harness_manifest_summary(task_dir, manifest)
+        payload["manifest"] = manifest.model_dump(mode="json")
+        payload["artifacts"] = self.harness_task_artifacts(session_id, task_id)
+        payload["events"] = read_events(task_dir, limit=50)
+        return payload
+
+    def harness_task_events(self, session_id: str, task_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        task_dir = self._harness_task_dir(session_id, task_id)
+        return read_events(task_dir, limit=limit)
+
+    def harness_task_artifacts(self, session_id: str, task_id: str) -> list[dict[str, Any]]:
+        task_dir = self._harness_task_dir(session_id, task_id)
+        manifest = load_manifest(task_dir)
+        artifacts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(kind: str, path_value: str, *, stage: str | None = None) -> None:
+            path = (task_dir / path_value).resolve()
+            if str(path) in seen:
+                return
+            seen.add(str(path))
+            item: dict[str, Any] = {
+                "stage": stage,
+                "kind": kind,
+                "path": str(path),
+                "relative_path": path_value,
+                "exists": path.exists(),
+            }
+            if path.exists() and path.is_file():
+                stat = path.stat()
+                item.update({"name": path.name, "suffix": path.suffix.lower(), "size": stat.st_size})
+            artifacts.append(item)
+
+        for stage in manifest.stages:
+            stage_paths = {
+                "input": stage.input_path,
+                "output": stage.output_path,
+                "eval": stage.eval_path,
+                "status": stage.status_path,
+            }
+            for kind, path_value in stage_paths.items():
+                if path_value:
+                    add(kind, path_value, stage=stage.id)
+        for kind, path_value in manifest.outputs.items():
+            add(f"output:{kind}", path_value)
+        for kind, path_value in manifest.reports.items():
+            add(f"report:{kind}", path_value)
+        return artifacts
+
+    def harness_task_continue(self, session_id: str, task_id: str, *, auto_rework: bool = False, max_rework: int = 1) -> dict[str, Any]:
+        task_dir = self._harness_task_dir(session_id, task_id)
+        action = HarnessRunner(task_dir).run_until_blocked(auto_rework=auto_rework, max_rework=max_rework)
+        return {"action": action.model_dump(mode="json"), "state": self.state(session_id)}
+
+    def harness_task_approve(self, session_id: str, task_id: str, *, stage: str, note: str = "approved") -> dict[str, Any]:
+        task_dir = self._harness_task_dir(session_id, task_id)
+        action = HarnessRunner(task_dir).approve(stage, note=note)
+        return {"action": action.model_dump(mode="json"), "state": self.state(session_id)}
+
+    def harness_task_reject(self, session_id: str, task_id: str, *, stage: str, reason: str) -> dict[str, Any]:
+        task_dir = self._harness_task_dir(session_id, task_id)
+        action = HarnessRunner(task_dir).reject(stage, reason=reason)
+        return {"action": action.model_dump(mode="json"), "state": self.state(session_id)}
+
+    def harness_task_gates(self, session_id: str, task_id: str, *, stage: str) -> dict[str, Any]:
+        task_dir = self._harness_task_dir(session_id, task_id)
+        gate = HarnessRunner(task_dir).run_stage_gate(stage)
+        return {"gate": gate.model_dump(mode="json"), "state": self.state(session_id)}
+
+    def _harness_task_dir(self, session_id: str, task_id: str) -> Path:
+        shell = self.sessions.get(session_id).shell
+        root = task_root(shell.cwd).resolve()
+        task_dir = (root / Path(task_id).name).resolve()
+        if not task_dir.is_relative_to(root) or not (task_dir / "manifest.json").exists():
+            raise KeyError(f"unknown Harness task: {task_id}")
+        return task_dir
+
+    @staticmethod
+    def _harness_manifest_summary(task_dir: Path, manifest: HarnessManifest) -> dict[str, Any]:
+        completed = sum(1 for stage in manifest.stages if stage.status in {"passed", "completed", "approved", "skipped"})
+        failed = sum(1 for stage in manifest.stages if stage.status in {"failed", "needs_rework"})
+        waiting = sum(1 for stage in manifest.stages if stage.status == "waiting_approval")
+        return {
+            "task_id": task_dir.name,
+            "task_dir": str(task_dir),
+            "title": manifest.topic,
+            "topic": manifest.topic,
+            "status": manifest.status,
+            "current_stage": manifest.current_stage,
+            "created_at": manifest.created_at,
+            "updated_at": manifest.updated_at,
+            "total_stages": len(manifest.stages),
+            "completed_stages": completed,
+            "failed_stages": failed,
+            "waiting_approval_stages": waiting,
+            "outputs": dict(manifest.outputs),
+            "reports": dict(manifest.reports),
+        }
 
     def parse_pdf(self, session_id: str, pdf_path: str) -> dict[str, Any]:
         """Parse a PDF with MinerU to extract text and figures."""

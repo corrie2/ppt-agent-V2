@@ -22,3 +22,8 @@ class UserSkillManifest(BaseModel):
     claude_compatible: bool = False
     allowed_tools: list[str] = Field(default_factory=list)
     agent_scope: list[str] = Field(default_factory=list)
+    applies_to: list[str] = Field(default_factory=list)
+    quality_gates: list[str] = Field(default_factory=list)
+    artifacts: dict[str, str] = Field(default_factory=dict)
+    examples: list[str] = Field(default_factory=list)
+    version: str = "1.0.0"

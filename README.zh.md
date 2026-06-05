@@ -9,6 +9,7 @@ English documentation: [README.md](README.md)
 ## 架构
 
 - `runtime/multi_agent_pipeline.py`：基于 LangGraph 的多智能体 PPT 规划流水线，每个 Agent 都对应一个 graph node。
+- `runtime/harness/`：Harness 风格任务的 manifest、阶段归档、事件日志、质量门和恢复元数据。
 - `runtime/renderer_engineer.py`：Renderer Engineer Agent 逻辑、渲染代码上下文提取、扩展方案和任务级辅助脚本输出。
 - `runtime/visual_quality.py`：Visual Quality Evaluator，负责 PPTX 生成后的结构化视觉指标、LLM 视觉质量评估和 `.visual_quality_report.json` 输出。
 - `runtime/agent_llm.py`：每个 Agent 的 provider/model 路由和 JSON-only LLM 调用。
@@ -32,9 +33,46 @@ ppt-agent run "季度产品路线图" --out deck.pptx
 ppt-agent plan "季度产品路线图" --spec plan.json
 ppt-agent build plan.json --out deck.pptx
 ppt-agent run "季度产品路线图" --mode plan
+ppt-agent run "讲解 Transformer attention" --skill-template course-teaching-deck --out deck.pptx
+ppt-agent serve
+ppt-agent task list
 ```
 
 对于非 evidence 驱动的普通 PPT，默认 `plan` / `run` 会使用多智能体流水线。
+
+## CLI 和 Web UI
+
+PPT Agent 在同一个本地运行时上提供两种入口：
+
+- CLI：`ppt`、`ppt-agent plan`、`ppt-agent build`、`ppt-agent run` 以及任务、反馈、Skill 等自动化命令。
+- Web UI：`ppt-agent serve`，启动本地 PPT Agent Studio，用于可视化管理工作区和生成流程。
+
+启动 Web UI：
+
+```bash
+ppt-agent serve
+```
+
+默认地址：
+
+```text
+http://127.0.0.1:7860
+```
+
+PPT Agent Studio 复用 CLI 的 `ShellSession`、`SkillRegistry`、planner、QA 和 build skill。当前包括：
+
+- 工作区文件扫描
+- 自然语言需求输入
+- 结构化 draft request 预览
+- 用户 Skill 可见性和会话级启用/禁用控制
+- plan 生成
+- 构建前人工审批
+- plan JSON 预览
+- 本地产物列表和链接
+- Agent / Skill 事件日志
+- Harness 任务进度，包括当前阶段、已完成阶段数和 manifest 链接
+
+Web UI 不替代 CLI。两者通过 service layer 复用同一套规划、Skill、QA 和构建逻辑，避免行为漂移。
 
 ## 多智能体 PPT 流水线
 
@@ -46,8 +84,7 @@ DeckIntent
   -> brief_outline node 生成 brief.json 和 outline.json
   -> brief_outline_eval node 评估 brief 和 outline
   -> content node 生成 content.json
-     || design_chart node 生成 design_chart.json
-  -> join 等待 content.json 和 design_chart.json
+  -> design_chart node 生成 design_chart.json
   -> content_eval node 评估 content
   -> design_chart_eval node 评估 design 和 chart 产物
   -> supervisor_merge node 合并为 slides_ir.json
@@ -82,8 +119,17 @@ DeckIntent
 
 ```text
 .ppt-agent/tasks/{task_id}/
+  manifest.json
   input/
     user_request.json
+  logs/
+    events.jsonl
+  stages/
+    {order}_{stage_id}/
+      input.json
+      output.json
+      eval.json
+      status.json
   intermediate/
     brief.json
     outline.json
@@ -97,12 +143,57 @@ DeckIntent
     renderer_engineer_report.json
     renderer_scripts/
     render_review_report.json
+    ppt_spec.json
   task_plan.json
 ```
 
-默认页数是 `15` 页。每个 Agent 都是一个 LangGraph node。Worker 之间通过 JSON 文件协作，不直接修改彼此产物。
+默认页数是 `15` 页。每个 Agent 都是一个 LangGraph node。Worker 之间通过 JSON 文件协作，不直接修改彼此产物。Harness 归档会保存每个阶段的输入、输出、评估、状态、事件和恢复元数据，后续 UI 或 CLI 可以查看进度，并从已有中间产物继续。
 
 Evaluator 作为旁路评估节点，会在关键产物生成后立即运行。系统先执行低成本规则检查；只有规则检查发现 warning/error 时，才调用 LLM Evaluator。触发条件包括 `severity = error`、`requires_rework = true` 或 `score < 0.75`。每个评估阶段最多触发一次局部返工。
+
+## Harness 任务和失败恢复
+
+Harness 任务命令用于查看和管理 `.ppt-agent/tasks/` 下归档的多智能体运行：
+
+```bash
+ppt-agent task list
+ppt-agent task inspect <task-id-or-path>
+ppt-agent task events <task-id-or-path> --limit 50
+ppt-agent task artifacts <task-id-or-path>
+ppt-agent task continue <task-id-or-path>
+ppt-agent task continue <task-id-or-path> --auto-rework --max-rework 1
+ppt-agent task approve <task-id-or-path> --stage plan_confirm --note "已确认"
+ppt-agent task reject <task-id-or-path> --stage plan_confirm --reason "需要修改大纲"
+ppt-agent task gates <task-id-or-path> --stage content
+ppt-agent task preview <task-id-or-path>
+ppt-agent task resume <task-id-or-path> --out resumed_plan.json
+ppt-agent task retry-stage <task-id-or-path> content --reason "需要更新"
+```
+
+关键行为：
+
+- `manifest.json` 记录任务状态、当前阶段、阶段输出、报告、最终 `ppt_spec` 和恢复提示。
+- `logs/events.jsonl` 记录阶段级进度事件，可用于生成过程视图。
+- 阶段目录保存 `input.json`、`output.json`、`eval.json` 和 `status.json` 快照。
+- 质量门优先执行确定性检查，尽量在调用昂贵 LLM 评估前发现问题。
+- 确认阶段（`plan_confirm`、`build_confirm`）可以暂停任务，等待用户批准或提出修改意见。
+- 页面预览会基于归档的 `ppt_spec` 在 `previews/` 下写入轻量级逐页 JSON 和 HTML 预览。
+- `retry-stage` 后接 `continue` 可以基于已归档的 `brief_outline` 产物，重新生成 `content` 及其下游阶段。Agent LLM 配置启用时会复用现有 LLM-capable pipeline node；LLM 不可用时回退到确定性逻辑。
+- `--auto-rework` 可以开启有次数上限的质量门自动返工；默认仍然是人工审阅。
+- `resume` 可以把归档中的最新 `ppt_spec` 导出为普通 plan 文件，继续构建或人工审阅。
+
+Studio 也通过只读 API 暴露同样的数据：
+
+```text
+GET /api/sessions/{session_id}/tasks
+GET /api/sessions/{session_id}/tasks/{task_id}
+GET /api/sessions/{session_id}/tasks/{task_id}/events
+GET /api/sessions/{session_id}/tasks/{task_id}/artifacts
+POST /api/sessions/{session_id}/tasks/{task_id}/continue
+POST /api/sessions/{session_id}/tasks/{task_id}/approve
+POST /api/sessions/{session_id}/tasks/{task_id}/reject
+POST /api/sessions/{session_id}/tasks/{task_id}/gates
+```
 
 ## Agent 模型路由
 
@@ -157,7 +248,20 @@ ppt-agent llm set-key deepseek --api-key <your-key>
 ppt-agent skill add <path-or-git-url>
 ppt-agent skill list
 ppt-agent skill validate <path-or-name>
+ppt-agent skill init-template academic-paper-deck
+ppt-agent skill init-template course-teaching-deck
+ppt-agent skill init-template business-report-deck
+ppt-agent skill init-template deck-quality-gate
 ```
+
+也可以在规划或运行时直接应用模板：
+
+```bash
+ppt-agent plan "讲解 RAG 检索增强生成" --skill-template course-teaching-deck --spec plan.json
+ppt-agent run "董事会 AI 采用汇报" --skill-template business-report-deck --out output/report.pptx
+```
+
+如果模板 Skill 尚不存在，PPT Agent 会自动创建到 `.ppt-agent/skills/`，并把 Skill 名写入 `DeckIntent.applied_skills`，让 Supervisor 可以分配给相关 Worker Agent。
 
 多智能体 skill 管理原则：
 
@@ -178,6 +282,18 @@ Page Generator 不接收内容型或风格型 skill。
   "description": "面向高管汇报的 slide 写作规范。",
   "type": "markdown",
   "agent_scope": ["content", "qa"]
+}
+```
+
+Skill manifest 也可以描述 v2 治理元数据：
+
+```json
+{
+  "applies_to": ["paper", "course", "business"],
+  "quality_gates": ["citation_required_when_evidence", "max_bullets_per_slide"],
+  "artifacts": {"qa_rules": "qa_rules.json"},
+  "examples": ["examples/request.json"],
+  "version": "2.0.0"
 }
 ```
 
@@ -203,6 +319,16 @@ Page Generator 不接收内容型或风格型 skill。
 ```
 
 每次运行时，最终的 `skill_policy`、`skill_catalog` 和 `skill_assignments` 会写入该任务的 `task_plan.json`。
+
+## 反馈沉淀
+
+可以用 feedback 命令沉淀已接受输出、项目偏好、纠错记录和失败模式，供后续规划或复盘使用：
+
+```bash
+ppt-agent feedback add "完整构建前优先做页面级预览" --type preference
+ppt-agent feedback add "Content 阶段遗漏 citation" --type failure --task <task-id> --stage content
+ppt-agent feedback accept <task-id> --note "已接受为销售汇报最终风格"
+```
 
 ## 文档转 PPT
 

@@ -29,9 +29,11 @@ from ppt_agent.runtime.agent_llm import default_agent_llm_config, write_default_
 from ppt_agent.runtime.plan_polisher import polish_plan_spec
 from ppt_agent.runtime.planner import resolve_planner_selection, test_planner_connection
 from ppt_agent.runtime.pptx import build_pptx
+from ppt_agent.runtime.harness import HarnessAction, HarnessRunner, read_events
+from ppt_agent.runtime.harness.manifest import invalidate_from_stage, load_manifest, resolve_task_dir, task_root
 from ppt_agent.runtime.visual_quality import evaluate_pptx_visual_quality, visual_quality_report_path
 from ppt_agent.storage.llm_settings import key_statuses, load_api_key, load_selection, save_api_key, save_selection
-from ppt_agent.storage.project_memory import retrieve_failure_patterns, retrieve_project_memory
+from ppt_agent.storage.project_memory import record_execution_trace, record_project_memory, retrieve_failure_patterns, retrieve_project_memory
 from ppt_agent.storage.plan_io import (
     MigratePlanResult,
     PLAN_SCHEMA_VERSION,
@@ -47,11 +49,15 @@ app = typer.Typer(help="PPT Agent CLI")
 llm_app = typer.Typer(help="LLM provider configuration")
 skill_app = typer.Typer(help="User skill management")
 agent_app = typer.Typer(help="Multi-agent configuration")
+task_app = typer.Typer(help="Harness task inspection, recovery, and retry commands")
+feedback_app = typer.Typer(help="Record feedback into project memory")
 console = Console()
 err_console = Console(stderr=True)
 app.add_typer(llm_app, name="llm")
 app.add_typer(skill_app, name="skill")
 app.add_typer(agent_app, name="agent")
+app.add_typer(task_app, name="task")
+app.add_typer(feedback_app, name="feedback")
 
 
 class IngestParser(str, Enum):
@@ -83,6 +89,7 @@ def plan(
     provider: Annotated[str | None, typer.Option("--provider", help="LLM provider override for planning.")] = None,
     model: Annotated[str | None, typer.Option("--model", help="LLM model override for planning.")] = None,
     allow_fallback: Annotated[bool, typer.Option("--allow-fallback", help="Use deterministic planner when configured LLM key is missing.")] = False,
+    skill_template: Annotated[list[str] | None, typer.Option("--skill-template", help="Apply and auto-create a v2 skill template. Can be repeated.")] = None,
 ) -> None:
     """Create a structured deck spec without building a PPTX."""
     _validate_llm_override(provider=provider, model=model)
@@ -105,6 +112,7 @@ def plan(
     if not effective_topic:
         err_console.print("[bold red]plan[/bold red]: topic is required unless --evidence is provided")
         raise typer.Exit(code=2)
+    applied_skill_templates = _ensure_skill_templates(Path.cwd(), skill_template or [])
 
     graph = create_agent_graph()
     if evidence_pack is None:
@@ -121,6 +129,7 @@ def plan(
         failure_patterns=failures.get("failure_patterns", []),
         source_digest=source_digest,
         source_context=(evidence_digest or {}).get("evidence_items", []) if evidence_digest else [],
+        applied_skills=applied_skill_templates,
     )
     _print_planner_run_info(
         evidence_digest=evidence_digest,
@@ -443,9 +452,11 @@ def run(
         bool,
         typer.Option("--auto-approve", help="Skip the interactive approval gate and build immediately after planning."),
     ] = False,
+    skill_template: Annotated[list[str] | None, typer.Option("--skill-template", help="Apply and auto-create a v2 skill template. Can be repeated.")] = None,
 ) -> None:
     """Run the agent loop."""
     _validate_llm_override(provider=provider, model=model)
+    applied_skill_templates = _ensure_skill_templates(Path.cwd(), skill_template or [])
     if from_plan is not None:
         document = _load_executable_plan(from_plan, command_name="from-plan")
         loaded_spec = document.spec
@@ -454,7 +465,12 @@ def run(
             console.print("[bold]plan[/bold]: using plan from file; ignoring provided topic")
 
         state = AgentState(
-            intent=DeckIntent(topic=effective_topic, audience=loaded_spec.audience, output_path=str(out)),
+            intent=DeckIntent(
+                topic=effective_topic,
+                audience=loaded_spec.audience,
+                output_path=str(out),
+                applied_skills=[*loaded_spec.applied_skills, *applied_skill_templates],
+            ),
             mode=mode,
             planner_provider=provider,
             planner_model=model,
@@ -477,6 +493,7 @@ def run(
             intent=DeckIntent(
                 topic=topic,
                 output_path=str(out),
+                applied_skills=applied_skill_templates,
                 project_preferences=memory.get("preferences", []),
                 failure_patterns=failures.get("failure_patterns", []),
             ),
@@ -1099,6 +1116,77 @@ def skill_init(name: Annotated[str, typer.Argument(help="Skill name.")]) -> None
     console.print(f"Created skill template at [bold]{target}[/bold]")
 
 
+@skill_app.command("init-template")
+def skill_init_template(
+    template: Annotated[str, typer.Argument(help="academic-paper-deck, course-teaching-deck, business-report-deck, or deck-quality-gate.")],
+    name: Annotated[str | None, typer.Option("--name", help="Override output skill directory name.")] = None,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing template skill.")] = False,
+) -> None:
+    """Create a v2 Skill template with policy, writing, layout, QA rules, and examples."""
+    target = _write_skill_template(Path.cwd(), template, name=name, force=force, command_name="skill init-template")
+    console.print(f"Created v2 skill template at [bold]{target}[/bold]")
+
+
+def _write_skill_template(root: Path, template: str, *, name: str | None = None, force: bool = False, command_name: str = "skill template") -> Path:
+    specs = _skill_template_specs()
+    if template not in specs:
+        raise typer.BadParameter(f"unknown template: {template}; choose one of {', '.join(sorted(specs))}")
+    spec = specs[template]
+    skill_name = name or spec["name"]
+    target = project_skill_dir(root) / skill_name
+    if target.exists():
+        if not force:
+            err_console.print(f"{command_name}: {target} already exists; use --force to overwrite")
+            raise typer.Exit(code=1)
+        shutil.rmtree(target)
+    (target / "examples").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "name": skill_name,
+        "description": spec["description"],
+        "when_to_use": spec["when_to_use"],
+        "type": "markdown",
+        "input_schema": {"type": "object", "properties": {}},
+        "allowed_builtin_skills": ["scan_workspace", "retrieve_project_memory", "generate_plan", "show_current_plan", "revise_plan"],
+        "requires_approval": False,
+        "is_read_only": True,
+        "agent_scope": spec["agent_scope"],
+        "applies_to": spec["applies_to"],
+        "quality_gates": spec["quality_gates"],
+        "artifacts": {
+            "task_policy": "task_policy.md",
+            "writing_rules": "writing_rules.md",
+            "layout_rules": "layout_rules.md",
+            "qa_rules": "qa_rules.json",
+        },
+        "examples": ["examples/request.json", "examples/expected_outline.json"],
+        "version": "2.0.0",
+    }
+    (target / "skill.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (target / "skill.md").write_text(spec["skill_md"], encoding="utf-8")
+    (target / "task_policy.md").write_text(spec["task_policy"], encoding="utf-8")
+    (target / "writing_rules.md").write_text(spec["writing_rules"], encoding="utf-8")
+    (target / "layout_rules.md").write_text(spec["layout_rules"], encoding="utf-8")
+    (target / "qa_rules.json").write_text(json.dumps(spec["qa_rules"], ensure_ascii=False, indent=2), encoding="utf-8")
+    (target / "examples" / "request.json").write_text(json.dumps(spec["example_request"], ensure_ascii=False, indent=2), encoding="utf-8")
+    (target / "examples" / "expected_outline.json").write_text(json.dumps(spec["expected_outline"], ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
+
+
+def _ensure_skill_templates(root: Path, templates: list[str]) -> list[str]:
+    applied: list[str] = []
+    specs = _skill_template_specs()
+    for template in templates:
+        if template not in specs:
+            raise typer.BadParameter(f"unknown skill template: {template}; choose one of {', '.join(sorted(specs))}")
+        skill_name = specs[template]["name"]
+        target = project_skill_dir(root) / skill_name
+        if not target.exists():
+            _write_skill_template(root, template, force=False, command_name="--skill-template")
+            console.print(f"[bold]skill[/bold]: created template [bold]{skill_name}[/bold]")
+        applied.append(skill_name)
+    return applied
+
+
 @skill_app.command("add")
 def skill_add(
     path_or_git_url: Annotated[str, typer.Argument(help="Local skill directory or Git URL.")],
@@ -1217,6 +1305,76 @@ def agent_show_config() -> None:
     console.print(default_agent_llm_config().model_dump_json(indent=2))
 
 
+def _skill_template_specs() -> dict[str, dict]:
+    base_rules = {
+        "required_fields": {"severity": "error", "description": "Every slide must have title and core message."},
+        "max_bullets_per_slide": {"severity": "warning", "max": 3},
+        "no_blank_slide_risk": {"severity": "error"},
+    }
+    return {
+        "academic-paper-deck": {
+            "name": "academic-paper-deck",
+            "description": "Generate research paper and technical report presentation decks with citations, method/result structure, and compact academic narration.",
+            "when_to_use": "Use for paper reading, thesis defense, research report, experiment result, and technical article presentation tasks.",
+            "agent_scope": ["brief_outline", "content", "qa", "page_designer"],
+            "applies_to": ["paper", "research", "academic", "experiment", "technical-report"],
+            "quality_gates": ["citation_required_when_evidence", "method_result_structure", "max_bullets_per_slide"],
+            "skill_md": "# academic-paper-deck\n\nUse this skill to turn research material into a rigorous but readable presentation. Preserve evidence, explain the problem-method-result chain, and avoid unsupported claims.\n",
+            "task_policy": "# Task Policy\n\nPrioritize factual grounding. Build the narrative as: background, problem, prior gap, method, experiments, results, contribution, limitations, future work.\n",
+            "writing_rules": "# Writing Rules\n\n- Use concise academic language.\n- Put the claim in the slide title or message.\n- Keep visible bullets to three or fewer.\n- Explain metrics and experimental setup before results.\n- Speaker notes may contain more detail than slide text.\n",
+            "layout_rules": "# Layout Rules\n\n- Use diagrams for method slides.\n- Use comparison tables for baselines and ablations.\n- Use figure-caption layouts for paper figures.\n- Keep citations visible in notes or captions.\n",
+            "qa_rules": {**base_rules, "citation_required_when_evidence": {"severity": "warning"}, "method_result_structure": {"severity": "warning"}},
+            "example_request": {"topic": "Paper reading deck for a machine learning paper", "slides": 12, "audience": "graduate students"},
+            "expected_outline": {"slides": ["Title", "Background", "Problem", "Method Overview", "Method Details", "Experiment Setup", "Main Results", "Ablation", "Limitations", "Takeaways"]},
+        },
+        "course-teaching-deck": {
+            "name": "course-teaching-deck",
+            "description": "Generate step-by-step course teaching decks with concept introduction, examples, visual explanations, and summary checks.",
+            "when_to_use": "Use for class teaching, concept explanation, knowledge walkthrough, tutorial, and training material.",
+            "agent_scope": ["brief_outline", "content", "qa", "page_designer"],
+            "applies_to": ["course", "teaching", "tutorial", "training", "knowledge-explanation"],
+            "quality_gates": ["concept_progression", "example_required", "max_bullets_per_slide"],
+            "skill_md": "# course-teaching-deck\n\nUse this skill to explain knowledge gradually. Make every major concept concrete with examples, diagrams, and checkpoints.\n",
+            "task_policy": "# Task Policy\n\nOrganize the deck as: motivation, prerequisite, concept, example, process, misconception, practice, summary.\n",
+            "writing_rules": "# Writing Rules\n\n- Use second-person or classroom-friendly language.\n- Start each section with why the concept matters.\n- Introduce one idea per slide.\n- Pair abstract terms with examples.\n",
+            "layout_rules": "# Layout Rules\n\n- Use process timelines for multi-step concepts.\n- Use side-by-side comparison for confusing ideas.\n- Use callout cards for key definitions.\n",
+            "qa_rules": {**base_rules, "concept_progression": {"severity": "warning"}, "example_required": {"severity": "warning"}},
+            "example_request": {"topic": "Teach DNS resolution to beginners", "slides": 10, "audience": "undergraduate students"},
+            "expected_outline": {"slides": ["Motivation", "Prerequisites", "Core Concept", "Step-by-step Flow", "Example", "Common Mistakes", "Practice", "Summary"]},
+        },
+        "business-report-deck": {
+            "name": "business-report-deck",
+            "description": "Generate executive business report decks with conclusion-first structure, evidence-backed insights, and action recommendations.",
+            "when_to_use": "Use for project reports, product reviews, business analysis, roadmap communication, and executive updates.",
+            "agent_scope": ["brief_outline", "content", "design_chart", "qa", "page_designer"],
+            "applies_to": ["business", "executive", "product", "roadmap", "operations"],
+            "quality_gates": ["action_recommendation_required", "data_support_required", "max_bullets_per_slide"],
+            "skill_md": "# business-report-deck\n\nUse this skill to produce decision-oriented reports. Lead with conclusions, support with evidence, and close with concrete actions.\n",
+            "task_policy": "# Task Policy\n\nOrganize as: executive summary, current state, key insight, options, recommendation, roadmap, risks, ask.\n",
+            "writing_rules": "# Writing Rules\n\n- Make titles assertive and conclusion-first.\n- Avoid vague recommendations.\n- Connect each data point to a decision.\n- Keep slides scannable for repeated review.\n",
+            "layout_rules": "# Layout Rules\n\n- Use comparison tables for options.\n- Use roadmap timelines for execution plans.\n- Use metric cards for KPI summaries.\n",
+            "qa_rules": {**base_rules, "action_recommendation_required": {"severity": "warning"}, "data_support_required": {"severity": "warning"}},
+            "example_request": {"topic": "Quarterly product roadmap review", "slides": 12, "audience": "executive team"},
+            "expected_outline": {"slides": ["Executive Summary", "Current State", "Key Metrics", "Insight", "Options", "Recommendation", "Roadmap", "Risks", "Decision Ask"]},
+        },
+        "deck-quality-gate": {
+            "name": "deck-quality-gate",
+            "description": "Reusable quality gate skill for checking slide structure, density, citations, renderability, and audience fit.",
+            "when_to_use": "Use whenever generated deck plans or PPTX outputs need deterministic and reviewable quality checks.",
+            "agent_scope": ["qa", "evaluator", "render_review", "page_designer"],
+            "applies_to": ["qa", "review", "quality-gate", "harness"],
+            "quality_gates": list(base_rules),
+            "skill_md": "# deck-quality-gate\n\nUse this skill to enforce deck quality before downstream rendering or user delivery.\n",
+            "task_policy": "# Task Policy\n\nBlock severe structural failures. Report warnings with actionable fixes. Prefer deterministic checks before LLM judgment.\n",
+            "writing_rules": "# Writing Rules\n\n- Report issues with slide number, rule id, severity, and suggested fix.\n- Do not rewrite content unless asked by the repair stage.\n",
+            "layout_rules": "# Layout Rules\n\n- Flag unsupported layouts.\n- Flag dense slides and likely overflow.\n- Flag missing visual hierarchy.\n",
+            "qa_rules": base_rules,
+            "example_request": {"topic": "Review generated deck quality", "slides": 10},
+            "expected_outline": {"checks": list(base_rules)},
+        },
+    }
+
+
 def _looks_like_git_url(value: str) -> bool:
     lowered = value.lower()
     return lowered.startswith("http://") or lowered.startswith("https://") or lowered.endswith(".git")
@@ -1261,6 +1419,285 @@ def serve(
         raise typer.Exit(code=1) from exc
     console.print(f"PPT Agent Studio: http://{host}:{port}")
     uvicorn.run("ppt_agent.server.app:app", host=host, port=port, reload=reload)
+
+
+@task_app.command("list")
+def task_list(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """List Harness task runs in .ppt-agent/tasks."""
+    root = task_root(Path.cwd())
+    rows = []
+    if root.exists():
+        for manifest_file in sorted(root.glob("*/manifest.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                manifest = load_manifest(manifest_file.parent)
+            except ValueError:
+                continue
+            rows.append(
+                {
+                    "task_id": manifest.task_id,
+                    "topic": manifest.topic,
+                    "status": manifest.status,
+                    "current_stage": manifest.current_stage,
+                    "updated_at": manifest.updated_at,
+                    "path": str(manifest_file.parent),
+                }
+            )
+    if json_output:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        console.print("No Harness tasks found.")
+        return
+    for row in rows:
+        console.print(f"{row['task_id']} [{row['status']}] {row['topic']}")
+        console.print(f"  stage={row['current_stage'] or '-'} updated={row['updated_at']}")
+
+
+@task_app.command("inspect")
+def task_inspect(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit full manifest JSON.")] = False,
+) -> None:
+    """Inspect one Harness task manifest."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    manifest = load_manifest(task_dir)
+    if json_output:
+        typer.echo(manifest.model_dump_json(indent=2))
+        return
+    console.print(f"Task: [bold]{manifest.task_id}[/bold]")
+    console.print(f"Topic: {manifest.topic}")
+    console.print(f"Status: {manifest.status}")
+    console.print(f"Current Stage: {manifest.current_stage or '-'}")
+    console.print(f"Resume: last={manifest.resume.get('last_passed_stage')} next={manifest.resume.get('next_stage')}")
+    console.print("Stages:")
+    for stage in manifest.stages:
+        issue_count = len(stage.issues)
+        console.print(f"  - {stage.id}: {stage.status} issues={issue_count} output={stage.output_path or '-'}")
+    if manifest.outputs:
+        console.print("Outputs:")
+        for name, path in manifest.outputs.items():
+            console.print(f"  {name}: {path}")
+    if manifest.reports:
+        console.print("Reports:")
+        for name, path in manifest.reports.items():
+            console.print(f"  {name}: {path}")
+
+
+@task_app.command("events")
+def task_events(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Number of recent events to show.")] = 50,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON events.")] = False,
+) -> None:
+    """Show task event log."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    events = read_events(task_dir, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(events, ensure_ascii=False, indent=2))
+        return
+    for event in events:
+        stage = f" [{event['stage_id']}]" if event.get("stage_id") else ""
+        console.print(f"{event.get('created_at')} {event.get('event')}{stage}")
+
+
+@task_app.command("artifacts")
+def task_artifacts(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON artifact list.")] = False,
+) -> None:
+    """List task artifacts from manifest and stage outputs."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    manifest = load_manifest(task_dir)
+    artifacts = []
+    for stage in manifest.stages:
+        for kind, value in (("input", stage.input_path), ("output", stage.output_path), ("eval", stage.eval_path), ("status", stage.status_path)):
+            if value:
+                artifacts.append({"stage": stage.id, "kind": kind, "path": value})
+    for name, path in manifest.outputs.items():
+        artifacts.append({"stage": None, "kind": f"output:{name}", "path": path})
+    for name, path in manifest.reports.items():
+        artifacts.append({"stage": None, "kind": f"report:{name}", "path": path})
+    if json_output:
+        typer.echo(json.dumps(artifacts, ensure_ascii=False, indent=2))
+        return
+    for item in artifacts:
+        prefix = item["stage"] or "task"
+        console.print(f"{prefix} {item['kind']}: {item['path']}")
+
+
+@task_app.command("resume")
+def task_resume(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Where to write a resumable plan JSON.")] = Path("resumed_plan.json"),
+) -> None:
+    """Recover the latest valid PptSpec from a task into a plan JSON."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    manifest = load_manifest(task_dir)
+    ppt_spec_path = manifest.outputs.get("ppt_spec")
+    if not ppt_spec_path:
+        raise typer.BadParameter("task has no ppt_spec output to resume from")
+    source = task_dir / ppt_spec_path
+    if not source.exists():
+        raise typer.BadParameter(f"ppt_spec output is missing: {source}")
+    spec = PptSpec.model_validate(_read_json_file(source, label="ppt spec"))
+    write_plan_document(
+        out,
+        intent=DeckIntent(topic=manifest.topic, audience=spec.audience),
+        spec=spec,
+        mode="plan",
+        approved=False,
+        transitions=["task_resume"],
+        metadata={"harness_task": {"task_id": manifest.task_id, "source": str(task_dir)}},
+    )
+    console.print(f"Recovered plan from task [bold]{manifest.task_id}[/bold]")
+    console.print(f"Output: [bold]{out}[/bold]")
+
+
+@task_app.command("retry-stage")
+def task_retry_stage(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    stage: Annotated[str, typer.Argument(help="Stage id to retry from, e.g. content.")],
+    reason: Annotated[str, typer.Option("--reason", help="Why this stage is being invalidated.")] = "manual retry",
+) -> None:
+    """Invalidate a stage and every downstream stage so a future runner can retry from it."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    manifest = load_manifest(task_dir)
+    if not manifest.stage(stage):
+        raise typer.BadParameter(f"unknown stage: {stage}")
+    invalidate_from_stage(task_dir, manifest, stage, reason=reason)
+    console.print(f"Invalidated [bold]{stage}[/bold] and downstream stages for task [bold]{manifest.task_id}[/bold]")
+
+
+@task_app.command("continue")
+def task_continue(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    auto_rework: Annotated[bool, typer.Option("--auto-rework", help="Try bounded automatic regeneration when gates request rework.")] = False,
+    max_rework: Annotated[int, typer.Option("--max-rework", help="Maximum automatic rework attempts per stage.")] = 1,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit runner action JSON.")] = False,
+) -> None:
+    """Advance a Harness task until completion, approval, rework, or failure."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    action = HarnessRunner(task_dir).run_until_blocked(auto_rework=auto_rework, max_rework=max_rework)
+    _print_harness_action(action, json_output=json_output)
+
+
+@task_app.command("run")
+def task_run(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    auto_rework: Annotated[bool, typer.Option("--auto-rework", help="Try bounded automatic regeneration when gates request rework.")] = False,
+    max_rework: Annotated[int, typer.Option("--max-rework", help="Maximum automatic rework attempts per stage.")] = 1,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit runner action JSON.")] = False,
+) -> None:
+    """Alias for task continue."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    action = HarnessRunner(task_dir).run_until_blocked(auto_rework=auto_rework, max_rework=max_rework)
+    _print_harness_action(action, json_output=json_output)
+
+
+@task_app.command("approve")
+def task_approve(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    stage: Annotated[str, typer.Option("--stage", help="Approval stage id.")] = "plan_confirm",
+    note: Annotated[str, typer.Option("--note", help="Approval note.")] = "approved",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit runner action JSON.")] = False,
+) -> None:
+    """Approve a waiting Harness confirmation point and continue."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    action = HarnessRunner(task_dir).approve(stage, note=note)
+    _print_harness_action(action, json_output=json_output)
+
+
+@task_app.command("reject")
+def task_reject(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    stage: Annotated[str, typer.Option("--stage", help="Approval stage id.")] = "plan_confirm",
+    reason: Annotated[str, typer.Option("--reason", help="Rejection reason.")] = "changes requested",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit runner action JSON.")] = False,
+) -> None:
+    """Reject a waiting Harness confirmation point."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    action = HarnessRunner(task_dir).reject(stage, reason=reason)
+    _print_harness_action(action, json_output=json_output)
+
+
+@task_app.command("gates")
+def task_gates(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    stage: Annotated[str, typer.Option("--stage", help="Stage id to check.")] = "content",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit gate JSON.")] = False,
+) -> None:
+    """Run deterministic quality gates for one archived stage."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    gate = HarnessRunner(task_dir).run_stage_gate(stage)
+    if json_output:
+        typer.echo(gate.model_dump_json(indent=2))
+        return
+    console.print(f"Stage: [bold]{stage}[/bold]")
+    console.print(f"Status: {gate.status} score={gate.score} next={gate.next_action}")
+    for issue in gate.issues:
+        console.print(f"  - {issue.severity} {issue.rule}: {issue.message}")
+
+
+@task_app.command("preview")
+def task_preview(
+    task: Annotated[str, typer.Argument(help="Task id or task directory.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit runner action JSON.")] = False,
+) -> None:
+    """Generate page-level preview JSON files from an archived ppt_spec."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    runner = HarnessRunner(task_dir)
+    runner.approve("plan_confirm", note="auto-approved for preview") if load_manifest(task_dir).stage("plan_confirm") and load_manifest(task_dir).stage("plan_confirm").status == "waiting_approval" else None
+    action = runner.run_until_blocked()
+    _print_harness_action(action, json_output=json_output)
+
+
+def _print_harness_action(action: HarnessAction, *, json_output: bool = False) -> None:
+    if json_output:
+        typer.echo(action.model_dump_json(indent=2))
+        return
+    console.print(f"Task: [bold]{action.task_id}[/bold]")
+    console.print(f"Action: {action.action}")
+    console.print(f"Stage: {action.stage_id or '-'}")
+    console.print(action.message)
+
+
+@feedback_app.command("add")
+def feedback_add(
+    text: Annotated[str, typer.Argument(help="Feedback text to remember.")],
+    type: Annotated[str, typer.Option("--type", help="preference, correction, failure, or accepted_output.")] = "preference",
+    task: Annotated[str | None, typer.Option("--task", help="Optional related Harness task id/path.")] = None,
+    stage: Annotated[str | None, typer.Option("--stage", help="Optional related stage id.")] = None,
+) -> None:
+    """Record user feedback into project memory."""
+    metadata = {"task": task, "stage": stage}
+    if type == "preference" or type == "correction":
+        result = record_project_memory(Path.cwd(), feedback=text, category=type, source="user_feedback", metadata=metadata)
+        console.print(f"Recorded project preference: {result['path']}")
+    elif type in {"failure", "accepted_output"}:
+        trace_type = "qa_failure" if type == "failure" else "accepted_output"
+        result = record_execution_trace(Path.cwd(), event=text, trace_type=trace_type, payload=metadata)
+        console.print(f"Recorded {trace_type}: {result['path']}")
+    else:
+        raise typer.BadParameter("--type must be preference, correction, failure, or accepted_output")
+
+
+@feedback_app.command("accept")
+def feedback_accept(
+    task: Annotated[str, typer.Argument(help="Accepted Harness task id or path.")],
+    note: Annotated[str, typer.Option("--note", help="Optional acceptance note.")] = "accepted generated output",
+) -> None:
+    """Record a task as an accepted output."""
+    task_dir = resolve_task_dir(Path.cwd(), task)
+    manifest = load_manifest(task_dir)
+    result = record_execution_trace(
+        Path.cwd(),
+        event=note,
+        trace_type="accepted_output",
+        payload={"task_id": manifest.task_id, "topic": manifest.topic, "outputs": manifest.outputs, "reports": manifest.reports},
+    )
+    console.print(f"Recorded accepted output: {result['path']}")
 
 
 def _validate_llm_override(*, provider: str | None, model: str | None) -> None:
