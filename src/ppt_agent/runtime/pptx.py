@@ -7,7 +7,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.util import Inches, Pt
 
-from ppt_agent.domain.evidence import EvidenceItem, EvidencePack, FigureAsset
+from ppt_agent.domain.evidence import EvidenceItem, EvidencePack, FigureAsset, TableAsset
 from ppt_agent.domain.models import Artifact, PptSpec, SlideSpec
 from ppt_agent.runtime.styles import StylePreset, get_style
 
@@ -30,6 +30,7 @@ def build_pptx(
     prs.slide_width = SLIDE_WIDTH
     prs.slide_height = SLIDE_HEIGHT
     figures_by_id = _figures_by_id(evidence_pack)
+    tables_by_id = _tables_by_id(evidence_pack)
     evidence_by_id = _evidence_by_id(evidence_pack)
 
     for slide_spec in spec.slides:
@@ -37,10 +38,12 @@ def build_pptx(
         _paint_background(slide, style)
         _apply_accent(slide, style)
         layout = _resolve_layout(slide_spec)
-        if figures_by_id:
-            _render_layout(slide, slide_spec, layout, style, figures_by_id=figures_by_id, evidence_path=evidence_path)
-        else:
-            _render_layout(slide, slide_spec, layout, style)
+        _render_layout(
+            slide, slide_spec, layout, style,
+            figures_by_id=figures_by_id,
+            tables_by_id=tables_by_id,
+            evidence_path=evidence_path,
+        )
         _add_source_footer(slide, slide_spec, style, evidence_by_id=evidence_by_id)
         notes_text = _speaker_notes_with_source_trace(
             slide_spec,
@@ -85,12 +88,16 @@ def _render_layout(
     style: StylePreset,
     *,
     figures_by_id: dict[str, FigureAsset] | None = None,
+    tables_by_id: dict[str, TableAsset] | None = None,
     evidence_path: Path | None = None,
 ) -> None:
     figure_layouts = {"figure_walkthrough", "figure_with_caption", "figure_caption", "two_column_figure", "method_figure_callouts"}
     if slide_spec.content.figure_ids and layout not in figure_layouts:
         layout = "figure_walkthrough"
-    elif slide_spec.content.table_ids and layout not in {"result_cards", "result_table_summary", "comparison_table"}:
+    # Tables only get their own layout if no figure_ids are present (figures take priority).
+    # When both figure_ids and table_ids exist, figures win; table data remains in slide_spec
+    # for source footnotes and speaker notes but is not rendered as a dedicated table layout.
+    if not slide_spec.content.figure_ids and slide_spec.content.table_ids and layout not in {"result_cards", "result_table_summary", "comparison_table"}:
         layout = "result_cards"
     renderer = {
         "hero": _render_academic_cover,
@@ -98,6 +105,9 @@ def _render_layout(
         "title-bullets": _render_title_bullets,
         "hero_image_plus_argument": _render_hero_image_plus_argument,
         "two_column_text_image": _render_two_column_text_image,
+        # NOTE: 'concept_explainer' intentionally uses the three-card layout renderer.
+        # The three-card summary is the closest generic layout for explaining concepts via
+        # three key points.  A dedicated concept_explainer renderer can be added later if needed.
         "concept_explainer": _render_three_card_summary,
         "three_card_summary": _render_three_card_summary,
         "method_step_flow": _render_process_timeline,
@@ -118,6 +128,8 @@ def _render_layout(
         return
     if layout in {"figure_walkthrough", "figure_with_caption", "figure_caption", "two_column_figure", "method_figure_callouts"}:
         renderer(slide, slide_spec, style, figures_by_id=figures_by_id or {}, evidence_path=evidence_path)
+    elif layout in {"result_cards", "result_table_summary"}:
+        renderer(slide, slide_spec, style, tables_by_id=tables_by_id or {}, evidence_path=evidence_path)
     else:
         renderer(slide, slide_spec, style)
 
@@ -363,25 +375,44 @@ def _render_method_figure_callouts(
     _add_textbox(slide, image_left, Inches(6.15), Inches(11.4), Inches(0.6), footer, 10, False, style.text_muted, font_name=style.font_name)
 
 
-def _render_result_table_summary(slide, slide_spec: SlideSpec, style: StylePreset) -> None:
+def _render_result_table_summary(
+    slide, slide_spec: SlideSpec, style: StylePreset,
+    *, tables_by_id: dict[str, TableAsset] | None = None, evidence_path: Path | None = None,
+) -> None:
     _add_section_title(slide, slide_spec.title, style)
     _add_textbox(slide, Inches(0.8), Inches(1.25), Inches(11.4), Inches(0.7), _slide_message(slide_spec), 18, True, style.primary, font_name=style.font_name)
-    summaries = [
-        _result_summary_text(item)
-        for item in slide_spec.content.result_summary
-    ] or [
-        str(metric.get("finding") or metric.get("value") or metric.get("metric") or metric)
-        for metric in slide_spec.content.metrics
-    ] or _visible_bullets(slide_spec)
-    while len(summaries) < 3:
-        summaries.append("Result detail not provided by evidence")
-    lefts = [Inches(0.85), Inches(4.55), Inches(8.25)]
-    for index, summary in enumerate(summaries[:3]):
-        card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, lefts[index], Inches(2.25), Inches(3.25), Inches(2.55))
-        card.fill.solid()
-        card.fill.fore_color.rgb = style.surface
-        card.line.color.rgb = style.border
-        _set_text(card.text_frame, summary, 15, True if index == 0 else False, style.primary if index == 0 else style.text_body)
+
+    # Try to render table images from evidence
+    table_rendered = False
+    if tables_by_id and slide_spec.content.table_ids:
+        for tid in slide_spec.content.table_ids[:1]:
+            table = tables_by_id.get(tid)
+            if table and table.path:
+                image_path = _resolve_evidence_asset_path(table.path, evidence_path=evidence_path)
+                if image_path and image_path.exists():
+                    try:
+                        slide.shapes.add_picture(str(image_path), Inches(0.8), Inches(2.1), width=Inches(11.4), height=Inches(4.0))
+                        table_rendered = True
+                    except Exception:
+                        pass  # fall through to text summary
+
+    if not table_rendered:
+        summaries = [
+            _result_summary_text(item)
+            for item in slide_spec.content.result_summary
+        ] or [
+            str(metric.get("finding") or metric.get("value") or metric.get("metric") or metric)
+            for metric in slide_spec.content.metrics
+        ] or _visible_bullets(slide_spec)
+        while len(summaries) < 3:
+            summaries.append("Result detail not provided by evidence")
+        lefts = [Inches(0.85), Inches(4.55), Inches(8.25)]
+        for index, summary in enumerate(summaries[:3]):
+            card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, lefts[index], Inches(2.25), Inches(3.25), Inches(2.55))
+            card.fill.solid()
+            card.fill.fore_color.rgb = style.surface
+            card.line.color.rgb = style.border
+            _set_text(card.text_frame, summary, 15, True if index == 0 else False, style.primary if index == 0 else style.text_body)
     trace = "Table summary: " + ", ".join(slide_spec.content.table_ids) if slide_spec.content.table_ids else "Table summary"
     if slide_spec.content.visual_reason:
         trace = f"{trace} - {slide_spec.content.visual_reason}"
@@ -602,19 +633,48 @@ def _draw_missing_figure_placeholder(slide, slide_spec: SlideSpec, style: StyleP
     _set_text(frame.text_frame, message, 18, True, style.primary, center=True, font_name=style.font_name)
 
 
-def _resolve_evidence_asset_path(path: str, *, evidence_path: Path | None) -> Path:
+def _resolve_evidence_asset_path(path: str, *, evidence_path: Path | None) -> Path | None:
     candidate = Path(path)
-    if candidate.is_absolute() or evidence_path is None:
-        return candidate
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+    if evidence_path is None:
+        return candidate if candidate.exists() else None
     if candidate.exists():
         return candidate
-    return evidence_path.parent / candidate
+    resolved = evidence_path.parent / candidate
+    if resolved.exists():
+        return resolved
+    # Fallback: try resolving against the ingest directory
+    # evidence_path is typically: workspace/.ppt-agent/data/evidence/<source_id>/evidence.json
+    # ingest images are typically: workspace/.ppt-agent/ingest/<source_id>/images/
+    try:
+        evidence_dir = evidence_path.parent  # .../evidence/<source_id>/
+        source_id = evidence_dir.name
+        workspace = evidence_dir.parent.parent.parent  # workspace/
+        ingest_dir = workspace / ".ppt-agent" / "ingest" / source_id
+        for sub in ("images", "assets", ""):
+            ingest_candidate = (ingest_dir / sub / candidate.name) if sub else (ingest_dir / candidate.name)
+            if ingest_candidate.exists():
+                return ingest_candidate
+        # Also try the candidate relative to ingest_dir
+        ingest_candidate = ingest_dir / candidate
+        if ingest_candidate.exists():
+            return ingest_candidate
+    except (ValueError, OSError):
+        pass
+    return None
 
 
 def _figures_by_id(evidence_pack: EvidencePack | None) -> dict[str, FigureAsset]:
     if evidence_pack is None:
         return {}
     return {figure.id: figure for figure in evidence_pack.figures}
+
+
+def _tables_by_id(evidence_pack: EvidencePack | None) -> dict[str, TableAsset]:
+    if evidence_pack is None:
+        return {}
+    return {table.id: table for table in evidence_pack.tables}
 
 
 def _evidence_by_id(evidence_pack: EvidencePack | None) -> dict[str, EvidenceItem]:

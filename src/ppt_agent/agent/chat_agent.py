@@ -98,9 +98,9 @@ class ChatAgent:
                 "content": self._system_prompt(registry, disabled_user_skills=session.disabled_user_skills),
             },
         ]
-        # Add conversation history (last 10 rounds)
+        # Add conversation history (last 20 messages)
         if history:
-            for entry in history[-20:]:  # max 20 messages = 10 rounds
+            for entry in history[-20:]:  # max 20 messages
                 messages.append({"role": entry["role"], "content": entry["content"]})
         # Add current user message with context
         messages.append({
@@ -181,9 +181,23 @@ class ChatAgent:
             return RouterDecision(reply=reply, skill_calls=skill_calls)
 
         if self._looks_like_build(lower) and session.latest_plan_path and self._has_skill(registry, "build_ppt"):
-            skill_calls.append(SkillCall(name="build_ppt", arguments={"plan_path": session.latest_plan_path}))
-            reply = "I can prepare the current plan for build approval."
-            return RouterDecision(reply=reply, skill_calls=skill_calls)
+            # Set pending_action directly (consistent with LLM path - shell handles build approval)
+            from ppt_agent.shell.session import PendingAction
+            plan_path = session.latest_plan_path
+            deck_name = "output.pptx"
+            if session.draft_request.output_name:
+                from pathlib import Path as _Path
+                deck_name = _Path(session.draft_request.output_name).name
+                if not _Path(deck_name).suffix:
+                    deck_name = f"{deck_name}.pptx"
+            session.pending_action = PendingAction(
+                skill_name="build_ppt",
+                arguments={"plan_path": plan_path, "output_path": str(session.output_dir / deck_name)},
+                description="build PPT from the current plan",
+            )
+            session.last_build_status = "pending_approval"
+            reply = "Build is pending approval. Run /approve to build the PPT."
+            return RouterDecision(reply=reply, skill_calls=[])
 
         if self._looks_like_planning(lower):
             pdfs = [item for item in session.discovered_sources if item["file_type"] == "pdf"]
@@ -329,16 +343,14 @@ class ChatAgent:
             "state_context": "The shell provides cwd, input/output dirs, sources, draft_request, latest artifacts, pending_action, provider and model.",
             "ppt_workflow": (
                 "When the user asks to create a PPT (e.g., '做一份PPT', 'generate slides', 'make a deck'):\n"
-                "1. First, propose what you will do (topic, audience, sources, style) and ask for confirmation\n"
-                "2. After user confirms (可以/好/yes/确认), call generate_plan AND build_ppt together\n"
-                "3. For build_ppt, set auto_approve=true so it executes without manual approval\n"
-                "4. Report the result (file path, slide count, file size)\n\n"
+                "1. Call generate_plan with the appropriate arguments (topic, sources, audience, theme, etc.)\n"
+                "2. The shell will automatically set up a pending build action after plan generation\n"
+                "3. Do NOT call build_ppt yourself - the shell handles build approval separately\n"
+                "4. After plan generation, tell the user the plan is ready and they can /approve to build\n\n"
                 "Available styles: corporate (default, business blue), academic (paper, serif font, dark red accent), "
                 "modern (clean, indigo accent, spacious), minimal (ultra-clean, side bar accent). "
                 "Auto-detect style from user message: 论文/研究生→academic, 现代/简约→modern, 极简→minimal, 商务→corporate.\n\n"
-                "Example skill_calls for confirmed PPT request:\n"
-                '[{"name": "generate_plan", "arguments": {..., "theme": "academic"}}, {"name": "build_ppt", "arguments": {}, "auto_approve": true}]\n\n'
-                "For small operations (scan files, list sources, check status), execute directly without confirmation.\n"
+                "For small operations (scan files, list sources, check status), execute directly.\n"
                 "For status queries (做好了吗, is it done), just report the current state."
             ),
             "conversation": (
@@ -390,6 +402,10 @@ class ChatAgent:
         confirm_patterns = ("可以", "好的", "确认", "就这样", "yes", "ok", "go", "开始吧", "去做吧", "执行")
         if any(pattern in lower for pattern in confirm_patterns):
             return False
+        # Exclude questions about doing things ("怎么做", "做什么", "在做")
+        not_planning_patterns = ("怎么做", "做什么", "在做", "你在做", "要做什么")
+        if any(pattern in lower for pattern in not_planning_patterns):
+            return False
         return any(
             token in lower
             for token in (
@@ -399,7 +415,6 @@ class ChatAgent:
                 "ppt",
                 "pdf",
                 "生成",
-                "做",
                 "做一份",
                 "deck",
             )

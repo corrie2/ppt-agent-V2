@@ -135,7 +135,3 @@ def get_style(name: str) -> StylePreset:
     """Resolve a style name to a StylePreset. Falls back to CORPORATE."""
     return _PRESETS.get(name.lower().strip(), CORPORATE)
 
-
-def list_styles() -> list[str]:
-    """Return available style names."""
-    return list(_PRESETS.keys())

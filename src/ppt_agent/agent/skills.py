@@ -416,6 +416,12 @@ def generate_plan_skill(
         set_progress_callback(None)
     
     emit_progress("Pipeline completed, validating spec...")
+    if "spec" not in result:
+        raise ValueError(
+            f"Agent graph returned no 'spec' key. "
+            f"Available keys: {list(result.keys())}. "
+            f"This likely indicates a pipeline error or incomplete execution."
+        )
     spec = PptSpec.model_validate(result["spec"])
     evidence_pack_for_render = None
     if resolved_source_digest and resolved_source_digest.get("type") == "evidence_pack":
@@ -710,7 +716,6 @@ def build_html_deck_skill(
             "reply": "HTML deck QA failed: " + "; ".join(html_errors),
         }
     session.latest_html_path = str(html_path)
-    session.latest_ppt_path = str(html_path)
     session.last_build_status = "completed"
     session.pending_action = None
     record_execution_trace_skill(
@@ -884,8 +889,20 @@ def _artifact_stem(session: ShellSession, spec: PptSpec) -> str:
 
 
 def _prepare_evidence_pack(session: ShellSession, sources: list[str]):
-    if len(sources) != 1:
+    if not sources:
         return None, None, []
+    if len(sources) > 1:
+        # MinerU evidence extraction only supports single-source packs.
+        # Process the first PDF source and warn about the rest.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Multi-source evidence skipped: %d sources provided, only the first will be processed by MinerU.",
+            len(sources),
+        )
+        session.latest_evidence_warnings = [
+            f"Only the first PDF ({Path(sources[0]).name}) was processed for figure extraction. "
+            f"{len(sources) - 1} other source(s) were skipped."
+        ]
     source = Path(sources[0])
     return ensure_mineru_evidence_for_source(source, workspace=session.cwd)
 

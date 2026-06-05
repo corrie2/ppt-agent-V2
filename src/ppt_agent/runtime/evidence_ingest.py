@@ -93,52 +93,125 @@ def attach_evidence_figures_to_spec(
     spec: PptSpec,
     pack: EvidencePack | None,
     selected_figure_ids: list[str] | None = None,
+    selected_table_ids: list[str] | None = None,
 ) -> PptSpec:
-    if not pack or not pack.figures:
+    if not pack or (not pack.figures and not pack.tables):
         return spec
 
     import logging
     logger = logging.getLogger(__name__)
 
+    valid_figure_ids = {f.id for f in pack.figures}
+    valid_table_ids = {t.id for t in pack.tables}
+
+    # ---- FIGURES ----
     # Priority: user selection > LLM assignment > auto-select
     if selected_figure_ids:
         # User selected figures — always use these, overwrite LLM's assignments
         figures = [f for f in pack.figures if f.id in selected_figure_ids]
         logger.info("Using %d user-selected figures: %s", len(figures), [f.id for f in figures])
     elif any(slide.content.figure_ids for slide in spec.slides):
-        # LLM already assigned figures, user didn't select — keep LLM's choices
+        # LLM already assigned figures, user didn't select — validate and filter
         assigned_ids = {
             fid for slide in spec.slides for fid in slide.content.figure_ids
         }
-        logger.info("Keeping LLM-assigned figures: %s", assigned_ids)
-        return spec
+        invalid_ids = assigned_ids - valid_figure_ids
+        if invalid_ids:
+            logger.warning("Removing invalid LLM-assigned figure_ids not in evidence pack: %s", invalid_ids)
+            # Filter out invalid IDs from slide content
+            slides = list(spec.slides)
+            for slide in slides:
+                original = slide.content.figure_ids
+                filtered = [fid for fid in original if fid in valid_figure_ids]
+                if filtered != original:
+                    slide.content.figure_ids = filtered
+            spec = spec.model_copy(update={"slides": slides})
+        remaining = assigned_ids & valid_figure_ids
+        if remaining:
+            logger.info("Keeping validated LLM-assigned figures: %s", remaining)
+            figures = []
+        else:
+            # All LLM-assigned figures were invalid — fall through to auto-select
+            logger.warning("All LLM-assigned figure_ids were invalid, falling through to auto-select")
+            figures = None  # sentinel for fall-through
     else:
-        # No user selection, no LLM assignment — auto-select
+        figures = None  # sentinel for fall-through
+
+    if figures is None:
+        # No user selection, no valid LLM assignment — auto-select
         max_figures = max(3, min(len(pack.figures), len(spec.slides) // 2))
-        figures = _selected_figures(pack.figures, max_items=max_figures)
+        figures = _selected_figures(pack.figures, max_items=max_figures) if pack.figures else []
         logger.info("Auto-selected %d figures", len(figures))
 
-    if not figures:
+    if figures:
+        slides = list(spec.slides)
+        candidate_indexes = _figure_slide_indexes(len(slides), len(figures))
+        for figure, slide_index in zip(figures, candidate_indexes):
+            slide = slides[slide_index]
+            slide.content.figure_ids = [figure.id]
+            slide.content.visual_reason = slide.content.visual_reason or "Use the source paper figure as direct visual evidence."
+            slide.visual_type = slide.visual_type or "figure_with_caption"
+            slide.layout = "figure_with_caption"
+            slide.layout_hint = "figure_with_caption"
+            slide.image_caption = slide.image_caption or figure.caption or figure.text or figure.id
+            if not any(citation.evidence_id == figure.id for citation in slide.citations):
+                slide.citations.append(Citation(evidence_id=figure.id, page=figure.page, source_file=figure.source_file))
+            if figure.id not in slide.evidence_refs:
+                slide.evidence_refs.append(figure.id)
+        logger.info("Final figure assignments: %d figures on slides %s", len(figures), list(candidate_indexes))
+        spec = spec.model_copy(update={"slides": slides})
+
+    # ---- TABLES ----
+    if not pack.tables:
         return spec
 
-    slides = list(spec.slides)
-    candidate_indexes = _figure_slide_indexes(len(slides), len(figures))
-    for figure, slide_index in zip(figures, candidate_indexes):
-        slide = slides[slide_index]
-        slide.content.figure_ids = [figure.id]
-        slide.content.visual_reason = slide.content.visual_reason or "Use the source paper figure as direct visual evidence."
-        slide.visual_type = slide.visual_type or "figure_with_caption"
-        slide.layout = "figure_with_caption"
-        slide.layout_hint = "figure_with_caption"
-        slide.image_caption = slide.image_caption or figure.caption or figure.text or figure.id
-        if not any(citation.evidence_id == figure.id for citation in slide.citations):
-            slide.citations.append(Citation(evidence_id=figure.id, page=figure.page, source_file=figure.source_file))
-        if figure.id not in slide.evidence_refs:
-            slide.evidence_refs.append(figure.id)
+    if selected_table_ids:
+        tables = [t for t in pack.tables if t.id in selected_table_ids]
+        logger.info("Using %d user-selected tables: %s", len(tables), [t.id for t in tables])
+    elif any(slide.content.table_ids for slide in spec.slides):
+        # LLM assigned table_ids — validate and filter
+        assigned_ids = {
+            tid for slide in spec.slides for tid in slide.content.table_ids
+        }
+        invalid_ids = assigned_ids - valid_table_ids
+        if invalid_ids:
+            logger.warning("Removing invalid LLM-assigned table_ids not in evidence pack: %s", invalid_ids)
+            slides = list(spec.slides)
+            for slide in slides:
+                original = slide.content.table_ids
+                filtered = [tid for tid in original if tid in valid_table_ids]
+                if filtered != original:
+                    slide.content.table_ids = filtered
+            spec = spec.model_copy(update={"slides": slides})
+        remaining = assigned_ids & valid_table_ids
+        if remaining:
+            logger.info("Keeping validated LLM-assigned tables: %s", remaining)
+        else:
+            logger.warning("All LLM-assigned table_ids were invalid")
+        return spec
+    else:
+        # Auto-select tables
+        max_tables = max(2, min(len(pack.tables), len(spec.slides) // 3))
+        tables = _selected_tables_list(pack.tables, max_items=max_tables)
+        logger.info("Auto-selected %d tables", len(tables))
 
-    used_ids = [f.id for f in figures]
-    logger.info("Final figure assignments: %d figures on slides %s", len(figures), list(candidate_indexes))
-    return spec.model_copy(update={"slides": slides})
+        if tables:
+            slides = list(spec.slides)
+            table_indexes = _table_slide_indexes(len(slides), len(tables))
+            for table, slide_index in zip(tables, table_indexes):
+                slide = slides[slide_index]
+                slide.content.table_ids = [table.id]
+                slide.content.visual_reason = slide.content.visual_reason or "Use the source paper table as direct evidence."
+                slide.visual_type = slide.visual_type or "result_table_summary"
+                slide.layout = slide.layout or "result_table_summary"
+                if not any(citation.evidence_id == table.id for citation in slide.citations):
+                    slide.citations.append(Citation(evidence_id=table.id, page=table.page, source_file=table.source_file))
+                if table.id not in slide.evidence_refs:
+                    slide.evidence_refs.append(table.id)
+            logger.info("Final table assignments: %d tables on slides %s", len(tables), list(table_indexes))
+            spec = spec.model_copy(update={"slides": slides})
+
+    return spec
 
 
 def _figure_slide_indexes(slide_count: int, figure_count: int) -> list[int]:
@@ -159,6 +232,31 @@ def _figure_slide_indexes(slide_count: int, figure_count: int) -> list[int]:
         else:
             break
     return indexes
+
+
+def _table_slide_indexes(slide_count: int, table_count: int) -> list[int]:
+    """Pick slide indexes for tables, preferring later slides (results section)."""
+    if slide_count <= 0:
+        return []
+    anchors = [max(1, slide_count // 2), max(1, (slide_count * 2) // 3), max(1, slide_count - 2), max(1, slide_count - 1)]
+    indexes: list[int] = []
+    for anchor in anchors:
+        index = min(slide_count - 1, anchor)
+        if index not in indexes:
+            indexes.append(index)
+        if len(indexes) >= table_count:
+            break
+    while len(indexes) < table_count:
+        candidate = min(slide_count - 1, len(indexes) + 1)
+        if candidate not in indexes:
+            indexes.append(candidate)
+        else:
+            break
+    return indexes
+
+
+def _selected_tables_list(tables: list[TableAsset], *, max_items: int) -> list[TableAsset]:
+    return [item[0] for item in _select_tables(tables, max_items=max_items)]
 
 
 SECTION_ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {

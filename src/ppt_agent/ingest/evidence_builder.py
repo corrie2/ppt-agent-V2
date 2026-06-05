@@ -97,7 +97,7 @@ class EvidenceBuilder:
                 SourceRef(
                     id=_source_id(source_path),
                     source_file=source_path.name,
-                    path=str(source_path),
+                    path=str(Path(source_path).resolve()),
                     title=source_path.stem,
                 )
             ],

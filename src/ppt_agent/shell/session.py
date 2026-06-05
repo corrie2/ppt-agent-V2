@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ppt_agent.storage.llm_settings import load_api_key, load_selection
 from ppt_agent.storage.project_memory import ensure_project_memory

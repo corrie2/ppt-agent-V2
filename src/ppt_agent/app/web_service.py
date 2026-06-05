@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,9 @@ class WebSession:
     events: list[str] = field(default_factory=list)
     background_task: Any = None  # threading.Thread for async skill execution
     conversation_history: list[dict[str, str]] = field(default_factory=list)  # [{"role": "user"/"assistant", "content": "..."}]
+    last_error: str | None = None  # set when background task fails
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    created_at: float = field(default_factory=time.time)
 
     MAX_HISTORY_ROUNDS = 10  # keep last 10 rounds (20 messages)
 
@@ -52,10 +57,30 @@ class WebSession:
 
 
 class WebSessionStore:
+    SESSION_TTL = 7200  # 2 hours in seconds
+
     def __init__(self) -> None:
         self._sessions: dict[str, WebSession] = {}
 
+    def _evict_expired(self) -> None:
+        """Remove sessions that have exceeded the TTL."""
+        now = time.time()
+        expired = [sid for sid, s in self._sessions.items() if now - s.created_at > self.SESSION_TTL]
+        for sid in expired:
+            del self._sessions[sid]
+
+    def has(self, session_id: str) -> bool:
+        """Check if a session exists and is not expired."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        if time.time() - session.created_at > self.SESSION_TTL:
+            del self._sessions[session_id]
+            return False
+        return True
+
     def create(self, *, cwd: Path | None = None, assistant_enabled: bool = True) -> WebSession:
+        self._evict_expired()
         shell = ShellSession.create(cwd)
         if assistant_enabled:
             shell.enable_assistant()
@@ -64,8 +89,38 @@ class WebSessionStore:
         web_session = WebSession(id=uuid4().hex, shell=shell, registry=registry)
         for warning in reload_user_skills(registry, session=shell):
             web_session.emit(f"Warning: {warning}")
+        # Auto-scan workspace for existing evidence files
+        self._restore_evidence_state(shell)
         self._sessions[web_session.id] = web_session
         return web_session
+
+    def _restore_evidence_state(self, shell: ShellSession) -> None:
+        """Scan workspace for existing evidence.json and restore state."""
+        evidence_dir = shell.workspace_dir / ".ppt-agent" / "data" / "evidence"
+        if not evidence_dir.exists():
+            return
+        # Find the most recently modified evidence.json
+        latest_path = None
+        latest_mtime = 0.0
+        for evidence_file in evidence_dir.rglob("evidence.json"):
+            try:
+                mtime = evidence_file.stat().st_mtime
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_path = evidence_file
+            except OSError:
+                continue
+        if latest_path:
+            shell.latest_evidence_path = str(latest_path)
+            # Restore figure selection from disk
+            selection_path = latest_path.parent / "selection.json"
+            if selection_path.exists():
+                try:
+                    with open(selection_path, "r", encoding="utf-8") as f:
+                        sel_data = json.load(f)
+                    shell.selected_figure_ids = list(sel_data.get("selected_figure_ids", []))
+                except (OSError, json.JSONDecodeError):
+                    pass
 
     def get(self, session_id: str) -> WebSession:
         try:
@@ -79,6 +134,11 @@ class PptAgentWebService:
         self.sessions = WebSessionStore()
 
     def create_session(self, *, cwd: str | None = None, assistant_enabled: bool = True) -> dict[str, Any]:
+        if cwd is not None:
+            resolved_cwd = Path(cwd).resolve()
+            allowed_root = Path.home().resolve()
+            if not resolved_cwd.is_relative_to(allowed_root):
+                raise ValueError(f"cwd must be under {allowed_root}")
         web_session = self.sessions.create(
             cwd=Path(cwd).resolve() if cwd else None,
             assistant_enabled=assistant_enabled,
@@ -115,6 +175,7 @@ class PptAgentWebService:
             "skill_catalog": _skill_catalog_payload(shell),
             "agent_skill_assignments": _agent_skill_assignments_payload(shell),
             "events": list(web_session.events),
+            "last_error": web_session.last_error,
             "artifacts": self.artifacts(session_id),
             "harness_tasks": self.harness_tasks(session_id),
         }
@@ -128,6 +189,7 @@ class PptAgentWebService:
 
     ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".docx", ".doc", ".md", ".txt", ".markdown"}
     MAX_FILENAME_LENGTH = 200
+    MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
     def upload_files(self, session_id: str, files: list[tuple[str, bytes]]) -> dict[str, Any]:
         """Upload files to the session's workspace directory.
@@ -146,6 +208,9 @@ class PptAgentWebService:
         uploaded = []
         errors = []
         for filename, data in files:
+            if len(data) > self.MAX_UPLOAD_BYTES:
+                errors.append(f"{filename}: file too large ({len(data)} bytes, max {self.MAX_UPLOAD_BYTES})")
+                continue
             from pathlib import Path
             suffix = Path(filename).suffix.lower()
             if suffix not in self.ALLOWED_UPLOAD_SUFFIXES:
@@ -201,10 +266,13 @@ class PptAgentWebService:
         shell.output_fn = web_session.emit
         
         shell.remember_message("user", message)
+        web_session.add_to_history("user", message)
         before = len(web_session.events)
 
         # Check if a background task is running
-        if web_session.background_task and web_session.background_task.is_alive():
+        with web_session._lock:
+            task_alive = web_session.background_task is not None and web_session.background_task.is_alive()
+        if task_alive:
             web_session.emit("(Previous task still running in background...)")
             return {
                 "messages": web_session.events[before:],
@@ -214,7 +282,6 @@ class PptAgentWebService:
 
         loop_state = run_agent_loop(message, session=shell, registry=registry, output_fn=web_session.emit)
         if loop_state.terminal_reason == "not_handled":
-            web_session.add_to_history("user", message)
             decision = web_session.agent.respond(shell, message, registry, history=web_session.conversation_history)
             web_session.emit(decision.reply)
             web_session.add_to_history("assistant", decision.reply)
@@ -241,11 +308,16 @@ class PptAgentWebService:
                         import logging
                         logging.getLogger(__name__).error("Background task crashed: %s", exc, exc_info=True)
                         web_session.emit(f"Error: Background task crashed - {exc}")
+                        with web_session._lock:
+                            web_session.last_error = str(exc)
                     finally:
-                        web_session.background_task = None
+                        with web_session._lock:
+                            web_session.background_task = None
                 
-                web_session.background_task = threading.Thread(target=_run_skills_in_background, daemon=True)
-                web_session.background_task.start()
+                with web_session._lock:
+                    web_session.last_error = None  # Clear previous error
+                    web_session.background_task = threading.Thread(target=_run_skills_in_background, daemon=True)
+                    web_session.background_task.start()
                 web_session.emit("(Running in background... You can continue chatting while this completes.)")
             else:
                 # Execute synchronously (short tasks)
@@ -277,6 +349,8 @@ class PptAgentWebService:
         return {"result": result, "state": self.state(session_id)}
 
     def approve_build(self, session_id: str) -> dict[str, Any]:
+        import logging
+        logger = logging.getLogger(__name__)
         web_session = self.sessions.get(session_id)
         shell = web_session.shell
         
@@ -286,11 +360,38 @@ class PptAgentWebService:
         action = shell.pending_action
         if not action:
             return {"result": {"ok": False, "message": "No pending build action."}, "state": self.state(session_id)}
+        
+        # Check if a background task is already running
+        with web_session._lock:
+            task_alive = web_session.background_task is not None and web_session.background_task.is_alive()
+        if task_alive:
+            return {"result": {"ok": False, "message": "Another task is already running."}, "state": self.state(session_id)}
+        
+        # Clear pending action and run build in background thread
+        shell.pending_action = None
         web_session.emit(f"-> {action.description}...")
-        result = web_session.registry.invoke(action.skill_name, **action.arguments)
-        if result.get("reply"):
-            web_session.emit(result["reply"])
-        return {"result": result, "state": self.state(session_id)}
+        
+        def _run_build_in_background():
+            try:
+                result = web_session.registry.invoke(action.skill_name, **action.arguments)
+                if result.get("reply"):
+                    web_session.emit(result["reply"])
+            except Exception as exc:
+                logger.error("Background build failed: %s", exc, exc_info=True)
+                web_session.emit(f"Error: Build failed - {exc}")
+                with web_session._lock:
+                    web_session.last_error = str(exc)
+            finally:
+                with web_session._lock:
+                    web_session.background_task = None
+        
+        with web_session._lock:
+            web_session.last_error = None
+            web_session.background_task = threading.Thread(target=_run_build_in_background, daemon=True)
+            web_session.background_task.start()
+        
+        web_session.emit("(Running build in background... You can continue chatting while this completes.)")
+        return {"result": {"ok": True, "message": "Build started"}, "state": self.state(session_id)}
 
     def latest_plan(self, session_id: str) -> dict[str, Any] | None:
         shell = self.sessions.get(session_id).shell
@@ -469,12 +570,42 @@ class PptAgentWebService:
         }
 
     def parse_pdf(self, session_id: str, pdf_path: str) -> dict[str, Any]:
-        """Parse a PDF with MinerU to extract text and figures."""
+        """Parse a PDF with MinerU to extract text and figures (runs in background)."""
+        import logging
+        logger = logging.getLogger(__name__)
         web_session = self.sessions.get(session_id)
-        result = web_session.registry.invoke("parse_pdf", pdf_path=pdf_path)
-        if result.get("reply"):
-            web_session.emit(result["reply"])
-        return {"ok": result.get("ok", False), "reply": result.get("reply"), "state": self.state(session_id)}
+        shell = web_session.shell
+        shell.output_fn = web_session.emit
+        
+        # Check if a background task is already running
+        with web_session._lock:
+            task_alive = web_session.background_task is not None and web_session.background_task.is_alive()
+        if task_alive:
+            return {"ok": False, "message": "Another task is already running.", "state": self.state(session_id)}
+        
+        web_session.emit(f"-> Parsing PDF: {pdf_path}...")
+        
+        def _run_parse_in_background():
+            try:
+                result = web_session.registry.invoke("parse_pdf", pdf_path=pdf_path)
+                if result.get("reply"):
+                    web_session.emit(result["reply"])
+            except Exception as exc:
+                logger.error("Background parse_pdf failed: %s", exc, exc_info=True)
+                web_session.emit(f"Error: PDF parsing failed - {exc}")
+                with web_session._lock:
+                    web_session.last_error = str(exc)
+            finally:
+                with web_session._lock:
+                    web_session.background_task = None
+        
+        with web_session._lock:
+            web_session.last_error = None
+            web_session.background_task = threading.Thread(target=_run_parse_in_background, daemon=True)
+            web_session.background_task.start()
+        
+        web_session.emit("(Parsing PDF in background... This may take several minutes.)")
+        return {"ok": True, "message": "PDF parsing started", "state": self.state(session_id)}
 
     def list_evidence_figures(self, session_id: str) -> dict[str, Any]:
         """List all figures from the evidence pack."""
@@ -514,9 +645,11 @@ class PptAgentWebService:
         }
 
     def select_evidence_figures(self, session_id: str, figure_ids: list[str]) -> dict[str, Any]:
-        """Store user's figure selection."""
+        """Store user's figure selection (persisted to disk)."""
         shell = self.sessions.get(session_id).shell
         shell.selected_figure_ids = list(figure_ids)
+        # Persist to disk alongside evidence.json
+        _persist_figure_selection(shell)
         return {"ok": True, "selected_ids": list(shell.selected_figure_ids)}
 
     def get_figure_image(self, session_id: str, figure_id: str) -> Path:
@@ -529,7 +662,7 @@ class PptAgentWebService:
         if not evidence_path:
             evidence_dir = shell.workspace_dir / ".ppt-agent" / "data" / "evidence"
             if evidence_dir.exists():
-                candidates = sorted(evidence_dir.rglob("evidence.json"), reverse=True)
+                candidates = sorted(evidence_dir.rglob("evidence.json"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if candidates:
                     evidence_path = str(candidates[0])
 
@@ -554,11 +687,17 @@ class PptAgentWebService:
             if fig.get("id") == figure_id:
                 fig_path = fig.get("path", "")
                 if fig_path:
-                    if not Path(fig_path).is_absolute():
+                    if Path(fig_path).is_absolute():
+                        # Absolute path - must also validate it's within evidence_dir
+                        resolved = Path(fig_path).resolve()
+                        if resolved.exists() and resolved.is_file() and resolved.is_relative_to(evidence_dir.resolve()):
+                            return resolved
+                    else:
+                        # Relative path - resolve relative to evidence_dir
                         fig_path = str(evidence_dir / fig_path)
-                    resolved = Path(fig_path).resolve()
-                    if resolved.exists() and resolved.is_file() and self._safe_resolve(evidence_dir, fig.get("path", "")):
-                        return resolved
+                        resolved = Path(fig_path).resolve()
+                        if resolved.exists() and resolved.is_file() and self._safe_resolve(evidence_dir, fig.get("path", "")):
+                            return resolved
                 break
 
         raise HTTPException(status_code=404, detail=f"Figure {figure_id} image not found.")
@@ -705,6 +844,24 @@ class PptAgentWebService:
         with open(evidence_json, "w", encoding="utf-8") as f:
             json.dump(pack_data, f, ensure_ascii=False, indent=2)
         return {"ok": True, "deleted_ids": deleted_ids, "source_file": source_file}
+
+
+def _persist_figure_selection(shell: ShellSession) -> None:
+    """Write selected_figure_ids to selection.json next to evidence.json."""
+    evidence_path = shell.latest_evidence_path
+    if not evidence_path:
+        return
+    from pathlib import Path
+    evidence_json = Path(evidence_path)
+    if evidence_json.is_dir():
+        selection_path = evidence_json / "selection.json"
+    else:
+        selection_path = evidence_json.parent / "selection.json"
+    try:
+        with open(selection_path, "w", encoding="utf-8") as f:
+            json.dump({"selected_figure_ids": list(shell.selected_figure_ids)}, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
 
 
 def _pending_action_payload(shell: ShellSession) -> dict[str, Any] | None:

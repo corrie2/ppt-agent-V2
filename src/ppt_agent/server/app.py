@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from ppt_agent.app.web_service import PptAgentWebService
+
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
 class CreateSessionRequest(BaseModel):
@@ -64,8 +66,31 @@ class TaskGateRequest(BaseModel):
 
 
 def create_app() -> FastAPI:
+    import logging
+    import os
+
+    _api_key = os.environ.get("PPT_AGENT_API_KEY", "")
+
     app = FastAPI(title="PPT Agent Studio", version="0.1.0")
     service = PptAgentWebService()
+
+    if _api_key:
+        @app.middleware("http")
+        async def _auth_middleware(request: Request, call_next):
+            # Allow the root HTML page without auth
+            if request.url.path == "/":
+                return await call_next(request)
+            header_key = request.headers.get("x-api-key", "")
+            auth_header = request.headers.get("authorization", "")
+            bearer = ""
+            if auth_header.lower().startswith("bearer "):
+                bearer = auth_header[7:]
+            if header_key != _api_key and bearer != _api_key:
+                raise HTTPException(status_code=401, detail="Missing or invalid API key.")
+            return await call_next(request)
+        logging.getLogger(__name__).info("API key authentication ENABLED (PPT_AGENT_API_KEY is set)")
+    else:
+        logging.getLogger(__name__).warning("API key authentication DISABLED (set PPT_AGENT_API_KEY to enable)")
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -74,6 +99,14 @@ def create_app() -> FastAPI:
     @app.post("/api/sessions")
     def create_session(request: CreateSessionRequest) -> dict[str, Any]:
         return service.create_session(cwd=request.cwd, assistant_enabled=request.assistant_enabled)
+
+    @app.get("/api/sessions/{session_id}/exists")
+    def session_exists(session_id: str) -> dict[str, Any]:
+        """Check if a session exists (for reconnect)."""
+        exists = service.sessions.has(session_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail="Session not found or expired.")
+        return {"exists": True}
 
     @app.get("/api/sessions/{session_id}/state")
     def get_state(session_id: str) -> dict[str, Any]:
@@ -84,9 +117,12 @@ def create_app() -> FastAPI:
         """Check if background task is running and get latest events."""
         def _get_status():
             ws = service.sessions.get(session_id)
+            total = len(ws.events)
+            offset = max(0, total - 20)
             return {
                 "busy": ws.background_task is not None and ws.background_task.is_alive(),
                 "events": ws.events[-20:],  # Last 20 events
+                "event_offset": offset,
                 "state": service.state(session_id),
             }
         return _get_or_404(_get_status)
@@ -100,7 +136,12 @@ def create_app() -> FastAPI:
         """Upload files (PDF, DOCX, MD, TXT) to the session workspace."""
         file_data = []
         for f in files:
+            content_length = f.size  # may be None
+            if content_length is not None and content_length > MAX_UPLOAD_SIZE:
+                raise HTTPException(status_code=413, detail=f"File {f.filename} exceeds 100 MB limit.")
             data = await f.read()
+            if len(data) > MAX_UPLOAD_SIZE:
+                raise HTTPException(status_code=413, detail=f"File {f.filename} exceeds 100 MB limit.")
             file_data.append((f.filename or "unnamed", data))
         return _get_or_404(lambda: service.upload_files(session_id, file_data))
 
@@ -175,8 +216,9 @@ def create_app() -> FastAPI:
     def artifact(session_id: str, path: str = Query(...)) -> FileResponse:
         state = _get_or_404(lambda: service.state(session_id))
         resolved = Path(path).resolve()
-        allowed_roots = [Path(state["input_dir"]).resolve(), Path(state["output_dir"]).resolve(), Path(state["cwd"]).resolve() / ".ppt-agent"]
-        if not any(_is_relative_to(resolved, root) for root in allowed_roots):
+        workspace_dir = Path(state["workspace_dir"]).resolve()
+        # Restrict to workspace_dir subtree only
+        if not _is_relative_to(resolved, workspace_dir):
             raise HTTPException(status_code=403, detail="Artifact path is outside the session workspace.")
         if not resolved.exists() or not resolved.is_file():
             raise HTTPException(status_code=404, detail="Artifact not found.")
@@ -234,7 +276,9 @@ def _get_or_404(fn):
         import logging
         logging.getLogger(__name__).warning("Validation error: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid request data.") from exc
-    except (IOError, OSError, RuntimeError) as exc:
+    except HTTPException:
+        raise
+    except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("Server error: %s", exc)
         raise HTTPException(status_code=500, detail="Internal server error.") from exc
@@ -776,6 +820,7 @@ INDEX_HTML = r"""<!doctype html>
     let chatHistory = [];
     const MAX_HISTORY = 200;
     let isSending = false;  // 防止重复发送
+    let lastEventIdx = 0;  // for index-based event dedup
 
     async function api(path, options = {}) {
       const response = await fetch(path, {
@@ -790,13 +835,37 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function start() {
+      // Try to reuse existing session from localStorage
+      const savedSessionId = localStorage.getItem("ppt_agent_session_id");
+      if (savedSessionId) {
+        try {
+          state = await api(`/api/sessions/${savedSessionId}/state`);
+          render();
+          // Auto-scan workspace
+          try {
+            const scanResult = await api(`/api/sessions/${state.session_id}/workspace/scan`, { method: "POST" });
+            state = scanResult.state;
+            lastEventIdx = (state.events || []).length;
+            render();
+          } catch (error) {
+            console.error("Auto-scan failed:", error);
+          }
+          return;
+        } catch (e) {
+          // Session not found or expired, clear and create new
+          localStorage.removeItem("ppt_agent_session_id");
+        }
+      }
+      // Create new session
       state = await api("/api/sessions", { method: "POST", body: JSON.stringify({ assistant_enabled: true }) });
+      localStorage.setItem("ppt_agent_session_id", state.session_id);
       render();
       
       // Auto-scan workspace on page load
       try {
         const scanResult = await api(`/api/sessions/${state.session_id}/workspace/scan`, { method: "POST" });
         state = scanResult.state;
+        lastEventIdx = (state.events || []).length;
         render();
       } catch (error) {
         console.error("Auto-scan failed:", error);
@@ -862,8 +931,13 @@ INDEX_HTML = r"""<!doctype html>
           body: JSON.stringify({ pdf_path: pdfPath }),
         });
         state = result.state;
-        if (result.reply) chatHistory.push(`PPT Agent: ${result.reply}`);
+        if (result.message) chatHistory.push(`PPT Agent: ${result.message}`);
         render();
+        // Start polling for background parse task
+        if (result.ok) {
+          lastEventIdx = (state.events || []).length;
+          pollStatus();
+        }
       } catch (error) {
         chatHistory.push(`PPT Agent: Parse error: ${error.message}`);
         render();
@@ -1393,7 +1467,7 @@ INDEX_HTML = r"""<!doctype html>
       return String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
     function escapeAttr(value) {
-      return String(value).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');
+      return String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');
     }
 
     function toggleSection(label) {
@@ -1544,18 +1618,22 @@ INDEX_HTML = r"""<!doctype html>
         for (const msg of newMessages) {
           if (msg.startsWith('[Progress]')) {
             chatHistory.push(msg);
-          } else if (!msg.startsWith('You:')) {
+          } else if (!msg.startsWith('You:') && !msg.startsWith('PPT Agent:')) {
             // Only add agent messages, not user messages (already added)
             chatHistory.push(`PPT Agent: ${msg}`);
+          } else if (msg.startsWith('PPT Agent:')) {
+            chatHistory.push(msg);
           }
         }
         render();
         
         // Start polling if background task is running
         if (newMessages.some(m => m.includes('(Running in background...)'))) {
+          lastEventIdx = (state.events || []).length;
           pollStatus();
         }
       } catch (error) {
+        input.value = message;  // Restore input on error so user can retry
         chatHistory.push(`PPT Agent: Error: ${error.message}`);
       } finally {
         isSending = false;
@@ -1572,13 +1650,19 @@ INDEX_HTML = r"""<!doctype html>
         try {
           const status = await api(`/api/sessions/${state.session_id}/status`);
           state = status.state;
-          // Add new events to chat history
-          const newEvents = status.events || [];
-          for (const evt of newEvents) {
-            if (!chatHistory.includes(evt) && !evt.startsWith('You:')) {
-              chatHistory.push(evt.startsWith('[Progress]') ? evt : `PPT Agent: ${evt}`);
+          // Add new events using index-based dedup
+          const offset = status.event_offset || 0;
+          const events = status.events || [];
+          for (let i = 0; i < events.length; i++) {
+            const globalIdx = offset + i;
+            if (globalIdx >= lastEventIdx) {
+              const evt = events[i];
+              if (!evt.startsWith('You:')) {
+                chatHistory.push(evt.startsWith('[Progress]') || evt.startsWith('PPT Agent:') ? evt : `PPT Agent: ${evt}`);
+              }
             }
           }
+          lastEventIdx = Math.max(lastEventIdx, offset + events.length);
           render();
           // Stop polling if task is done
           if (!status.busy) {
@@ -1613,7 +1697,15 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const result = await api(`/api/sessions/${state.session_id}/builds/approve`, { method: "POST" });
         state = result.state;
+        if (result.result && result.result.message) {
+          chatHistory.push(`PPT Agent: ${result.result.message}`);
+        }
         render();
+        // Start polling for background build
+        if (result.result && result.result.ok) {
+          lastEventIdx = (state.events || []).length;
+          pollStatus();
+        }
       } catch (error) {
         chatHistory.push(`PPT Agent: Build error: ${error.message}`);
         render();

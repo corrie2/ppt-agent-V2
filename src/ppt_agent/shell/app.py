@@ -110,8 +110,12 @@ def run_shell(
             if is_cancel_utterance(text):
                 handle_command("/cancel", session=current_session, registry=current_registry, output_fn=output_fn)
                 continue
-            output_fn("There is a pending build action. Please confirm with /approve or cancel with /cancel.")
-            continue
+            # Only block messages that would trigger a new action (planning/build)
+            lower_text = text.lower()
+            if current_agent._looks_like_planning(lower_text) or current_agent._looks_like_build(lower_text):
+                output_fn("There is a pending build action. Please confirm with /approve or cancel with /cancel.")
+                continue
+            # Allow questions, status checks, and general conversation through
 
         disabled_skill = _explicit_disabled_user_skill(text, current_session)
         if disabled_skill:
@@ -497,7 +501,14 @@ def _continue_pending_user_request_after_scan(*, session: ShellSession, registry
     }
     arguments = registry.validate_arguments("generate_plan", arguments)
     arguments = _prepare_generate_plan_arguments(session, registry=registry, arguments=arguments, output_fn=output_fn)
-    result = registry.invoke("generate_plan", **arguments)
+    try:
+        result = registry.invoke("generate_plan", **arguments)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("generate_plan failed in _continue_pending_user_request_after_scan: %s", exc, exc_info=True)
+        output_fn(f"Error: Plan generation failed - {exc}")
+        session.pending_user_request = None
+        return
     session.pending_user_request = None
     reply = result.get("reply")
     if reply:
@@ -539,7 +550,6 @@ def _set_pending_build_from_plan_result(result: dict, *, session: ShellSession, 
         output_fn(f"- Topic: {session.current_request}")
     if sources:
         output_fn(f"- Source PDFs: {', '.join(Path(path).name for path in sources)}")
-        output_fn(f"Plan sources: {', '.join(Path(path).name for path in sources)}")
     if session.draft_request.audience:
         output_fn(f"- Audience: {session.draft_request.audience}")
     if result.get("plan_summary"):
@@ -548,6 +558,25 @@ def _set_pending_build_from_plan_result(result: dict, *, session: ShellSession, 
         output_fn(f"- Evidence: {session.latest_evidence_path}")
     for warning in session.latest_evidence_warnings[:3]:
         output_fn(f"Warning: {warning}")
+
+    # Show plan document details: slide count, titles, grounding warnings
+    plan_path = result.get("plan_path")
+    if plan_path:
+        try:
+            document = read_plan_document(Path(plan_path))
+            spec = document.spec
+            slides = spec.slides
+            output_fn(f"- Slide count: {len(slides)}")
+            for i, slide in enumerate(slides[:5]):
+                output_fn(f"  {i+1}. {slide.title}")
+            if len(slides) > 5:
+                output_fn(f"  ... and {len(slides) - 5} more slides")
+            for warning in spec.grounding_warnings[:3]:
+                output_fn(f"Warning: {warning}")
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug("Could not read plan for summary: %s", exc)
+
     output_format = result.get("output_format") or session.draft_request.output_format or "pptx"
     applied_skills = result.get("applied_skills") or session.draft_request.applied_skills
     if applied_skills:
