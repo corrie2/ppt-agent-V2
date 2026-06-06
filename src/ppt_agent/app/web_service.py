@@ -299,11 +299,16 @@ class PptAgentWebService:
                     try:
                         for skill_call in decision.skill_calls:
                             try:
-                                _execute_skill_call(skill_call, session=shell, registry=registry, output_fn=web_session.emit)
+                                result = _execute_skill_call(skill_call, session=shell, registry=registry, output_fn=web_session.emit)
+                                if isinstance(result, dict) and result.get("ok") is False:
+                                    with web_session._lock:
+                                        web_session.last_error = result.get("reply") or f"{skill_call.name} failed"
                             except Exception as exc:
                                 import logging
                                 logging.getLogger(__name__).error("Background skill %s failed: %s", skill_call.name, exc, exc_info=True)
                                 web_session.emit(f"Error: {skill_call.name} failed - {exc}")
+                                with web_session._lock:
+                                    web_session.last_error = str(exc)
                     except Exception as exc:
                         import logging
                         logging.getLogger(__name__).error("Background task crashed: %s", exc, exc_info=True)
@@ -367,8 +372,7 @@ class PptAgentWebService:
         if task_alive:
             return {"result": {"ok": False, "message": "Another task is already running."}, "state": self.state(session_id)}
         
-        # Clear pending action and run build in background thread
-        shell.pending_action = None
+        # Don't clear pending_action yet — only clear on success
         web_session.emit(f"-> {action.description}...")
         
         def _run_build_in_background():
@@ -376,6 +380,12 @@ class PptAgentWebService:
                 result = web_session.registry.invoke(action.skill_name, **action.arguments)
                 if result.get("reply"):
                     web_session.emit(result["reply"])
+                if result.get("ok") is False:
+                    with web_session._lock:
+                        web_session.last_error = result.get("reply") or "Build failed"
+                else:
+                    # Only clear pending_action on success
+                    shell.pending_action = None
             except Exception as exc:
                 logger.error("Background build failed: %s", exc, exc_info=True)
                 web_session.emit(f"Error: Build failed - {exc}")
@@ -590,6 +600,9 @@ class PptAgentWebService:
                 result = web_session.registry.invoke("parse_pdf", pdf_path=pdf_path)
                 if result.get("reply"):
                     web_session.emit(result["reply"])
+                if result.get("ok") is False:
+                    with web_session._lock:
+                        web_session.last_error = result.get("reply") or "PDF parsing failed"
             except Exception as exc:
                 logger.error("Background parse_pdf failed: %s", exc, exc_info=True)
                 web_session.emit(f"Error: PDF parsing failed - {exc}")

@@ -117,12 +117,17 @@ def create_app() -> FastAPI:
         """Check if background task is running and get latest events."""
         def _get_status():
             ws = service.sessions.get(session_id)
+            with ws._lock:
+                busy = ws.background_task is not None and ws.background_task.is_alive()
+                events_snapshot = list(ws.events)[-20:]
+                last_err = ws.last_error
             total = len(ws.events)
             offset = max(0, total - 20)
             return {
-                "busy": ws.background_task is not None and ws.background_task.is_alive(),
-                "events": ws.events[-20:],  # Last 20 events
+                "busy": busy,
+                "events": events_snapshot,
                 "event_offset": offset,
+                "last_error": last_err,
                 "state": service.state(session_id),
             }
         return _get_or_404(_get_status)
@@ -847,6 +852,7 @@ INDEX_HTML = r"""<!doctype html>
             state = scanResult.state;
             lastEventIdx = (state.events || []).length;
             render();
+            loadMaterials();
           } catch (error) {
             console.error("Auto-scan failed:", error);
           }
@@ -867,6 +873,7 @@ INDEX_HTML = r"""<!doctype html>
         state = scanResult.state;
         lastEventIdx = (state.events || []).length;
         render();
+        loadMaterials();
       } catch (error) {
         console.error("Auto-scan failed:", error);
       }
@@ -897,7 +904,7 @@ INDEX_HTML = r"""<!doctype html>
       renderArtifacts();
       renderEvents();
       renderPreview();
-      loadMaterials();
+      // Note: loadMaterials() is called explicitly, not on every render tick
     }
 
     function renderFiles() {
@@ -912,7 +919,7 @@ INDEX_HTML = r"""<!doctype html>
       
       filesContent.innerHTML = files.map(file => {
         const isPdf = (file.file_type || '').toLowerCase().includes('pdf') || (file.name || '').toLowerCase().endsWith('.pdf');
-        const parseBtn = isPdf ? ` <button class="parse-pdf-btn" onclick="parsePdf('${escapeHtml(file.path)}')" style="font-size:10px;padding:1px 6px;border-radius:3px;border:1px solid #e2e8f0;background:#fffbeb;cursor:pointer;color:#92400e;">Parse</button>` : '';
+        const parseBtn = isPdf ? ` <button class="parse-pdf-btn" data-pdf-path="${escapeAttr(file.path)}" style="font-size:10px;padding:1px 6px;border-radius:3px;border:1px solid #e2e8f0;background:#fffbeb;cursor:pointer;color:#92400e;">Parse</button>` : '';
         return `
         <div class="item">
           <strong>${escapeHtml(file.name)}</strong>${parseBtn}
@@ -922,7 +929,16 @@ INDEX_HTML = r"""<!doctype html>
 
     }
 
-    window.parsePdf = async function(pdfPath) {
+    // Event delegation for parse buttons (avoids path escaping issues in onclick)
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('.parse-pdf-btn');
+      if (btn && btn.dataset.pdfPath) {
+        e.preventDefault();
+        parsePdf(btn.dataset.pdfPath);
+      }
+    });
+
+    async function parsePdf(pdfPath) {
       chatHistory.push(`You: Parse PDF: ${pdfPath}`);
       renderEvents();
       try {
@@ -1338,7 +1354,7 @@ INDEX_HTML = r"""<!doctype html>
         html += `<div class="material-group">`;
         html += `<div class="material-group-header" onclick="this.parentElement.classList.toggle('open')">`;
         html += `<span>${escapeHtml(src.source_file)} <span class="count">(${total})</span></span>`;
-        html += `<span class="delete-btn" onclick="event.stopPropagation();deleteSource('${escapeHtml(src.source_file)}')">Delete All</span>`;
+        html += `<span class="delete-btn" onclick="event.stopPropagation();deleteSource('${escapeAttr(src.source_file)}')">Delete All</span>`;
         html += '</div>';
         html += '<div class="material-group-body"><div class="material-preview-grid">';
         for (const fig of src.figures) {
@@ -1644,11 +1660,14 @@ INDEX_HTML = r"""<!doctype html>
 
     // Poll status for background tasks
     let statusPollInterval = null;
+    let pollErrorCount = 0;
     async function pollStatus() {
       if (statusPollInterval) clearInterval(statusPollInterval);
+      pollErrorCount = 0;
       statusPollInterval = setInterval(async () => {
         try {
           const status = await api(`/api/sessions/${state.session_id}/status`);
+          pollErrorCount = 0;
           state = status.state;
           // Add new events using index-based dedup
           const offset = status.event_offset || 0;
@@ -1663,16 +1682,29 @@ INDEX_HTML = r"""<!doctype html>
             }
           }
           lastEventIdx = Math.max(lastEventIdx, offset + events.length);
-          render();
+          renderEvents();
           // Stop polling if task is done
           if (!status.busy) {
             clearInterval(statusPollInterval);
             statusPollInterval = null;
-            chatHistory.push("PPT Agent: Task completed!");
+            if (status.last_error) {
+              chatHistory.push(`PPT Agent: Task failed: ${status.last_error}`);
+            } else {
+              chatHistory.push("PPT Agent: Task completed!");
+            }
+            // Refresh evidence/materials after task completes
+            loadMaterials();
             render();
           }
         } catch (e) {
+          pollErrorCount++;
           console.error("Status poll error:", e);
+          if (pollErrorCount >= 5) {
+            clearInterval(statusPollInterval);
+            statusPollInterval = null;
+            chatHistory.push("PPT Agent: Lost connection to server. Please refresh the page.");
+            render();
+          }
         }
       }, 3000); // Poll every 3 seconds
     }
