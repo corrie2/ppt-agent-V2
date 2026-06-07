@@ -352,6 +352,38 @@ ppt-agent repair plan.json --qa qa_report.json --evidence .ppt-agent/evidence.js
 
 MinerU 是可选依赖。如果没有安装 MinerU，可以使用 Markdown 输入或预先生成的 parser 输出。
 
+### 可选：MinerU GPU 加速
+
+PPT Agent 不会把 CUDA 版 PyTorch 写进默认项目依赖。CUDA 依赖和用户机器强绑定，取决于操作系统、NVIDIA 驱动、Python 版本、显卡型号以及 CUDA 版 PyTorch 是否正确安装。
+
+启动 PPT Agent Studio 时，`ppt-agent serve` 默认会同时启动并预热本地 `mineru-api` 服务。后续 PDF 解析会复用这个常驻服务，而不是每次解析都重新启动 MinerU。运行时会检测当前 Python 环境：如果 `torch.cuda.is_available()` 为 `True`，就让 MinerU 优先使用 CUDA；否则自动回落到 CPU。
+
+检查当前环境是否能使用 GPU：
+
+```bash
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+```
+
+如果需要 NVIDIA GPU 加速，请到 PyTorch 官方选择器按自己的系统、Python 版本、驱动和 CUDA 版本安装对应的 CUDA 版 PyTorch：
+
+```text
+https://pytorch.org/get-started/locally/
+```
+
+不要直接复制另一台机器的 CUDA 安装命令。如果需要临时强制设备，可以设置：
+
+```bash
+PPT_AGENT_MINERU_DEVICE=cuda
+```
+
+常用 Studio 启动方式：
+
+```bash
+ppt-agent serve
+ppt-agent serve --no-preload-mineru
+ppt-agent serve --mineru-port 8010
+```
+
 ## LLM 配置
 
 ```bash

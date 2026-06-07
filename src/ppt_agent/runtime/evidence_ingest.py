@@ -6,7 +6,7 @@ from typing import Any
 from ppt_agent.domain.evidence import ClaimEvidence, EvidencePack, FigureAsset, SectionEvidence, TableAsset
 from ppt_agent.domain.models import Citation, PptSpec
 from ppt_agent.ingest import EvidenceBuilder, MinerUAdapter
-from ppt_agent.ingest.mineru_adapter import MinerUOptions
+from ppt_agent.ingest.mineru_adapter import MinerUOptions, detect_mineru_device
 from ppt_agent.runtime.source_store import source_id_for_path
 
 
@@ -36,9 +36,7 @@ def ensure_mineru_evidence_for_source(
 
     workdir = workspace / ".ppt-agent" / "ingest" / source_id
     try:
-        parse_result = MinerUAdapter(
-            options=options or MinerUOptions(backend="pipeline", method="auto", timeout_seconds=600)
-        ).parse(source_path, workdir)
+        parse_result = MinerUAdapter(options=options or _default_mineru_options()).parse(source_path, workdir)
         pack = EvidenceBuilder().build(parse_result)
     except (RuntimeError, ValueError, OSError) as exc:
         return None, None, [f"{source_path.name}: MinerU evidence generation failed: {exc}"]
@@ -46,6 +44,34 @@ def ensure_mineru_evidence_for_source(
     evidence_dir.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(pack.to_json(), encoding="utf-8")
     return pack, evidence_path, warnings
+
+
+def _default_mineru_options() -> MinerUOptions:
+    import os
+
+    device, _reason = detect_mineru_device()
+    api_url = os.environ.get("PPT_AGENT_MINERU_API_URL")
+    return MinerUOptions(
+        backend=os.environ.get("PPT_AGENT_MINERU_BACKEND", "pipeline"),
+        method=os.environ.get("PPT_AGENT_MINERU_METHOD", "auto"),
+        lang=os.environ.get("PPT_AGENT_MINERU_LANG", "en"),
+        formula=_env_bool("PPT_AGENT_MINERU_FORMULA", default=False),
+        table=_env_bool("PPT_AGENT_MINERU_TABLE", default=False),
+        image_analysis=_env_bool("PPT_AGENT_MINERU_IMAGE_ANALYSIS", default=False),
+        timeout_seconds=int(os.environ.get("PPT_AGENT_MINERU_TIMEOUT", "600")),
+        batch_size=int(os.environ.get("PPT_AGENT_MINERU_BATCH_SIZE", "1")),
+        device=device,
+        api_url=api_url,
+    )
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    import os
+
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def evidence_digest(pack: EvidencePack, *, evidence_path: Path | None) -> dict[str, Any]:

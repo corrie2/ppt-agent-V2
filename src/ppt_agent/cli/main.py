@@ -1410,6 +1410,10 @@ def serve(
     host: Annotated[str, typer.Option("--host", help="Host interface for the web server.")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", help="Port for the web server.")] = 7000,
     reload: Annotated[bool, typer.Option("--reload", help="Reload server when source files change.")] = False,
+    preload_mineru: Annotated[bool, typer.Option("--preload-mineru/--no-preload-mineru", help="Start and warm a MinerU API service with PPT Agent Studio.")] = True,
+    mineru_host: Annotated[str, typer.Option("--mineru-host", help="Host interface for the managed MinerU API service.")] = "127.0.0.1",
+    mineru_port: Annotated[int, typer.Option("--mineru-port", help="Port for the managed MinerU API service.")] = 8000,
+    mineru_preload_timeout: Annotated[int, typer.Option("--mineru-preload-timeout", help="Seconds to wait for the managed MinerU API service to become healthy.")] = 180,
 ) -> None:
     """Start the PPT Agent Studio web UI."""
     try:
@@ -1417,7 +1421,19 @@ def serve(
     except ImportError as exc:
         err_console.print("[bold red]serve[/bold red]: missing uvicorn. Install the web dependencies first.")
         raise typer.Exit(code=1) from exc
+    import os
+
+    if preload_mineru:
+        os.environ["PPT_AGENT_PRELOAD_MINERU"] = "1"
+        os.environ["PPT_AGENT_MINERU_HOST"] = mineru_host
+        os.environ["PPT_AGENT_MINERU_PORT"] = str(mineru_port)
+        os.environ["PPT_AGENT_MINERU_PRELOAD_TIMEOUT"] = str(mineru_preload_timeout)
+        os.environ["PPT_AGENT_MINERU_API_URL"] = f"http://{mineru_host}:{mineru_port}"
+    else:
+        os.environ["PPT_AGENT_PRELOAD_MINERU"] = "0"
     console.print(f"PPT Agent Studio: http://{host}:{port}")
+    if preload_mineru:
+        console.print(f"MinerU API preload: http://{mineru_host}:{mineru_port}")
     uvicorn.run("ppt_agent.server.app:app", host=host, port=port, reload=reload)
 
 

@@ -73,6 +73,33 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="PPT Agent Studio", version="0.1.0")
     service = PptAgentWebService()
+    logger = logging.getLogger(__name__)
+
+    @app.on_event("startup")
+    def _startup_mineru_api() -> None:
+        if os.environ.get("PPT_AGENT_PRELOAD_MINERU", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        from ppt_agent.ingest.mineru_adapter import detect_mineru_device, ensure_mineru_api_server
+
+        device, reason = detect_mineru_device()
+        host = os.environ.get("PPT_AGENT_MINERU_HOST", "127.0.0.1")
+        port = int(os.environ.get("PPT_AGENT_MINERU_PORT", "8000"))
+        timeout = int(os.environ.get("PPT_AGENT_MINERU_PRELOAD_TIMEOUT", "180"))
+        enable_vlm_preload = os.environ.get("PPT_AGENT_MINERU_VLM_PRELOAD", "1").strip().lower() in {"1", "true", "yes", "on"}
+        logger.info("Starting MinerU API preload: device=%s (%s), host=%s, port=%s", device, reason, host, port)
+        try:
+            api_url, status = ensure_mineru_api_server(
+                host=host,
+                port=port,
+                device=device,
+                enable_vlm_preload=enable_vlm_preload,
+                timeout_seconds=timeout,
+            )
+        except Exception as exc:
+            logger.error("MinerU API preload failed: %s", exc, exc_info=True)
+            return
+        os.environ["PPT_AGENT_MINERU_API_URL"] = api_url
+        logger.info("MinerU API preload ready: %s (%s)", api_url, status)
 
     if _api_key:
         @app.middleware("http")
@@ -951,7 +978,7 @@ INDEX_HTML = r"""<!doctype html>
         render();
         // Start polling for background parse task
         if (result.ok) {
-          lastEventIdx = (state.events || []).length;
+          lastEventIdx = Math.max(0, (state.events || []).length - 2);
           pollStatus();
         }
       } catch (error) {
@@ -1661,9 +1688,13 @@ INDEX_HTML = r"""<!doctype html>
     // Poll status for background tasks
     let statusPollInterval = null;
     let pollErrorCount = 0;
+    let statusPollStartedAt = 0;
+    let lastBusyNoticeAt = 0;
     async function pollStatus() {
       if (statusPollInterval) clearInterval(statusPollInterval);
       pollErrorCount = 0;
+      statusPollStartedAt = Date.now();
+      lastBusyNoticeAt = 0;
       statusPollInterval = setInterval(async () => {
         try {
           const status = await api(`/api/sessions/${state.session_id}/status`);
@@ -1683,6 +1714,15 @@ INDEX_HTML = r"""<!doctype html>
           }
           lastEventIdx = Math.max(lastEventIdx, offset + events.length);
           renderEvents();
+          if (status.busy) {
+            const now = Date.now();
+            if (!lastBusyNoticeAt || now - lastBusyNoticeAt >= 30000) {
+              const elapsed = Math.max(1, Math.round((now - statusPollStartedAt) / 1000));
+              chatHistory.push(`PPT Agent: Background task is still running (${elapsed}s elapsed).`);
+              lastBusyNoticeAt = now;
+              render();
+            }
+          }
           // Stop polling if task is done
           if (!status.busy) {
             clearInterval(statusPollInterval);

@@ -356,6 +356,38 @@ Intermediate files:
 
 MinerU is optional. If MinerU is not installed, use Markdown input or pre-created parser output.
 
+### Optional MinerU GPU Acceleration
+
+PPT Agent keeps CUDA-specific packages out of the default project dependencies. MinerU can run on CPU, and GPU acceleration depends on the user's operating system, NVIDIA driver, Python version, and CUDA-enabled PyTorch build.
+
+When PPT Agent Studio starts with `ppt-agent serve`, it starts and warms a local `mineru-api` service by default. PDF parsing reuses that service instead of starting a fresh MinerU process for each file. The runtime checks the current Python environment and asks MinerU to use CUDA when `torch.cuda.is_available()` is true; otherwise it falls back to CPU.
+
+Check the active device in your environment:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+```
+
+For NVIDIA GPU acceleration, install the CUDA-enabled PyTorch build that matches your machine from the official PyTorch selector:
+
+```text
+https://pytorch.org/get-started/locally/
+```
+
+Do not blindly copy another machine's CUDA install command. If you need to force a device for debugging, set:
+
+```bash
+PPT_AGENT_MINERU_DEVICE=cuda
+```
+
+Useful Studio startup options:
+
+```bash
+ppt-agent serve
+ppt-agent serve --no-preload-mineru
+ppt-agent serve --mineru-port 8010
+```
+
 ## LLM Configuration
 
 ```bash

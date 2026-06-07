@@ -7,6 +7,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,8 @@ class MinerUOptions:
     timeout_seconds: int | None = None
     batch_threshold: int = 8  # pages; switch to batched mode above this
     batch_size: int = 2  # pages per batch (1GB GPU, keep small to avoid OOM)
+    device: str | None = None
+    api_url: str | None = None
 
 
 class MinerUAdapter:
@@ -49,8 +53,6 @@ class MinerUAdapter:
     def _run_mineru_batched(self, input_path: Path, output_dir: Path, page_count: int) -> None:
         """Process large PDFs in batches using a persistent MinerU server (model loaded once)."""
         import signal
-        import time
-        import urllib.request
 
         batch_size = self.options.batch_size
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -60,37 +62,41 @@ class MinerUAdapter:
             if old.is_dir():
                 shutil.rmtree(old, ignore_errors=True)
 
-        # Find a free port for MinerU server
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
+        server_proc = None
+        if self.options.api_url:
+            api_url = self.options.api_url
+        else:
+            # Find a free port for MinerU server
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
 
-        api_url = f"http://127.0.0.1:{port}"
-        env = os.environ.copy()
-        env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            api_url = f"http://127.0.0.1:{port}"
+            env = _mineru_env(self.options.device)
 
-        # Start MinerU server once
-        _logger.info("Starting MinerU server on %s (model loads once)...", api_url)
-        server_proc = subprocess.Popen(
-            [sys.executable, "-m", "mineru.cli.fast_api", "--host", "127.0.0.1", "--port", str(port)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+            # Start MinerU server once
+            _logger.info("Starting MinerU server on %s (model loads once)...", api_url)
+            server_proc = subprocess.Popen(
+                [sys.executable, "-m", "mineru.cli.fast_api", "--host", "127.0.0.1", "--port", str(port)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
 
         try:
             # Wait for server to be ready
-            for _ in range(120):  # up to 120s for model loading
-                if server_proc.poll() is not None:
-                    raise RuntimeError("MinerU server exited unexpectedly during startup")
-                try:
-                    urllib.request.urlopen(f"{api_url}/health", timeout=2)
-                    break
-                except Exception:
-                    time.sleep(1)
-            else:
-                raise RuntimeError("MinerU server failed to start within 120s")
-            _logger.info("MinerU server ready on %s", api_url)
+            if server_proc is not None:
+                for _ in range(120):  # up to 120s for model loading
+                    if server_proc.poll() is not None:
+                        raise RuntimeError("MinerU server exited unexpectedly during startup")
+                    try:
+                        urllib.request.urlopen(f"{api_url}/health", timeout=2)
+                        break
+                    except Exception:
+                        time.sleep(1)
+                else:
+                    raise RuntimeError("MinerU server failed to start within 120s")
+                _logger.info("MinerU server ready on %s", api_url)
 
             for batch_start in range(0, page_count, batch_size):
                 batch_end = min(batch_start + batch_size, page_count)
@@ -107,6 +113,8 @@ class MinerUAdapter:
                     timeout_seconds=self.options.timeout_seconds,
                     batch_threshold=999999,
                     batch_size=999999,
+                    device=self.options.device,
+                    api_url=self.options.api_url,
                 )
                 batch_adapter = MinerUAdapter(batch_opts)
                 batch_adapter._run_mineru(input_path, batch_dir, api_url=api_url)
@@ -131,21 +139,22 @@ class MinerUAdapter:
             raise
         finally:
             # Always stop the server
-            _logger.info("Stopping MinerU server...")
-            server_proc.send_signal(signal.SIGTERM)
-            try:
-                server_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                server_proc.kill()
-                server_proc.wait()
+            if server_proc is not None:
+                _logger.info("Stopping MinerU server...")
+                server_proc.send_signal(signal.SIGTERM)
+                try:
+                    server_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server_proc.kill()
+                    server_proc.wait()
 
     def _run_mineru(self, input_path: Path, output_dir: Path, *, api_url: str | None = None) -> None:
         if shutil.which("mineru") is None:
             raise RuntimeError("MinerU is not installed or not found in PATH")
         output_dir.mkdir(parents=True, exist_ok=True)
-        command = _build_mineru_command(input_path=input_path, output_dir=output_dir, options=self.options, api_url=api_url)
-        env = os.environ.copy()
-        env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        resolved_api_url = api_url or self.options.api_url
+        command = _build_mineru_command(input_path=input_path, output_dir=output_dir, options=self.options, api_url=resolved_api_url)
+        env = _mineru_env(self.options.device)
         try:
             subprocess.run(
                 command,
@@ -170,6 +179,7 @@ class MinerUAdapter:
             page_range = ""
             if self.options.start is not None or self.options.end is not None:
                 page_range = f" (pages {self.options.start or 0}-{self.options.end or '?'})"
+            _terminate_mineru_children()
             raise RuntimeError(
                 f"MinerU timed out{page_range} after {self.options.timeout_seconds} seconds"
             ) from exc
@@ -196,6 +206,109 @@ def _build_mineru_command(*, input_path: Path, output_dir: Path, options: MinerU
     if options.image_analysis is not None:
         command.extend(["--image-analysis", str(options.image_analysis).lower()])
     return command
+
+
+def _mineru_env(device: str | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    if device:
+        env["MINERU_DEVICE_MODE"] = device
+        if device.startswith("cuda"):
+            env.setdefault("MINERU_LMDEPLOY_DEVICE", "cuda")
+            env.setdefault("MINERU_VLLM_DEVICE", "cuda")
+    return env
+
+
+def detect_mineru_device() -> tuple[str, str]:
+    forced = os.environ.get("PPT_AGENT_MINERU_DEVICE") or os.environ.get("MINERU_DEVICE_MODE")
+    if forced:
+        return forced, "forced by environment"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0) if torch.cuda.device_count() else "CUDA GPU"
+            return "cuda", f"torch CUDA available: {name}"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps", "torch MPS available"
+    except Exception as exc:
+        _logger.debug("Torch device detection failed: %s", exc, exc_info=True)
+    if shutil.which("nvidia-smi"):
+        return "cpu", "NVIDIA driver detected, but current torch cannot use CUDA"
+    return "cpu", "no accelerator detected"
+
+
+def ensure_mineru_api_server(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    device: str | None = None,
+    enable_vlm_preload: bool = True,
+    timeout_seconds: int = 180,
+) -> tuple[str, str]:
+    url = f"http://{host}:{port}"
+    if _mineru_api_healthy(url):
+        return url, "already running"
+    if shutil.which("mineru-api") is None:
+        raise RuntimeError("mineru-api is not installed or not found in PATH")
+
+    resolved_device = device or detect_mineru_device()[0]
+    command = [
+        "mineru-api",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--enable-vlm-preload",
+        str(enable_vlm_preload).lower(),
+    ]
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    subprocess.Popen(
+        command,
+        env=_mineru_env(resolved_device),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _mineru_api_healthy(url):
+            return url, f"started with device={resolved_device}"
+        time.sleep(1)
+    raise RuntimeError(f"MinerU API did not become healthy within {timeout_seconds} seconds")
+
+
+def _mineru_api_healthy(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=2) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def _terminate_mineru_children() -> None:
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Process | "
+                    "Where-Object { $_.CommandLine -like '*multiprocessing.spawn*mineru*' -or "
+                    "$_.CommandLine -like '*mineru.cli*' } | "
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        _logger.debug("Failed to terminate MinerU child processes after timeout", exc_info=True)
 
 
 def _has_mineru_output(output_dir: Path) -> bool:
