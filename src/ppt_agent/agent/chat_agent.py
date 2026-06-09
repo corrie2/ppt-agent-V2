@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import re
@@ -21,6 +22,16 @@ def _get_http_client() -> httpx.Client:
             _http_client = httpx.Client(timeout=180.0)
         return _http_client
 
+
+def _close_http_client() -> None:
+    global _http_client
+    with _http_client_lock:
+        if _http_client is not None and not _http_client.is_closed:
+            _http_client.close()
+            _http_client = None
+
+
+atexit.register(_close_http_client)
 from ppt_agent.agent.skill_registry import SkillRegistry
 from ppt_agent.llm.providers import PROVIDER_SPECS
 from ppt_agent.shell.session import PendingUserRequest, ShellSession

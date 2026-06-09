@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -45,8 +46,9 @@ class WebSession:
     MAX_HISTORY_ROUNDS = 10  # keep last 10 rounds (20 messages)
 
     def emit(self, line: str) -> None:
-        self.events.append(line)
-        self.events = self.events[-200:]
+        with self._lock:
+            self.events.append(line)
+            self.events = self.events[-200:]
 
     def add_to_history(self, role: str, content: str) -> None:
         """Add a message to conversation history, truncating if needed."""
@@ -61,23 +63,31 @@ class WebSessionStore:
 
     def __init__(self) -> None:
         self._sessions: dict[str, WebSession] = {}
+        self._store_lock = threading.Lock()
 
     def _evict_expired(self) -> None:
         """Remove sessions that have exceeded the TTL."""
-        now = time.time()
-        expired = [sid for sid, s in self._sessions.items() if now - s.created_at > self.SESSION_TTL]
-        for sid in expired:
-            del self._sessions[sid]
+        with self._store_lock:
+            now = time.time()
+            expired = [
+                sid
+                for sid, s in self._sessions.items()
+                if now - s.created_at > self.SESSION_TTL
+                and (s.background_task is None or not s.background_task.is_alive())
+            ]
+            for sid in expired:
+                del self._sessions[sid]
 
     def has(self, session_id: str) -> bool:
         """Check if a session exists and is not expired."""
-        session = self._sessions.get(session_id)
-        if session is None:
-            return False
-        if time.time() - session.created_at > self.SESSION_TTL:
-            del self._sessions[session_id]
-            return False
-        return True
+        with self._store_lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            if time.time() - session.created_at > self.SESSION_TTL:
+                del self._sessions[session_id]
+                return False
+            return True
 
     def create(self, *, cwd: Path | None = None, assistant_enabled: bool = True) -> WebSession:
         self._evict_expired()
@@ -91,7 +101,8 @@ class WebSessionStore:
             web_session.emit(f"Warning: {warning}")
         # Auto-scan workspace for existing evidence files
         self._restore_evidence_state(shell)
-        self._sessions[web_session.id] = web_session
+        with self._store_lock:
+            self._sessions[web_session.id] = web_session
         return web_session
 
     def _restore_evidence_state(self, shell: ShellSession) -> None:
@@ -123,10 +134,11 @@ class WebSessionStore:
                     pass
 
     def get(self, session_id: str) -> WebSession:
-        try:
-            return self._sessions[session_id]
-        except KeyError as exc:
-            raise KeyError(f"unknown session: {session_id}") from exc
+        with self._store_lock:
+            try:
+                return self._sessions[session_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown session: {session_id}") from exc
 
 
 class PptAgentWebService:
@@ -231,9 +243,21 @@ class PptAgentWebService:
             # Atomic write: write to temp file then rename
             try:
                 fd, tmp_path = tempfile.mkstemp(dir=str(workspace_dir), suffix=suffix)
-                with open(fd, "wb") as f:
-                    f.write(data)
-                Path(tmp_path).rename(dest)
+                try:
+                    with open(fd, "wb") as f:
+                        f.write(data)
+                    try:
+                        Path(tmp_path).rename(dest)
+                    except OSError:
+                        # Cross-device link fallback
+                        shutil.move(tmp_path, str(dest))
+                finally:
+                    # Clean up temp file if it still exists (rename/move succeeded)
+                    if Path(tmp_path).exists():
+                        try:
+                            Path(tmp_path).unlink()
+                        except OSError:
+                            pass
             except OSError as exc:
                 errors.append(f"{filename}: write failed ({exc})")
                 continue
@@ -267,7 +291,8 @@ class PptAgentWebService:
         
         shell.remember_message("user", message)
         web_session.add_to_history("user", message)
-        before = len(web_session.events)
+        events_snapshot = list(web_session.events)
+        before = len(events_snapshot)
 
         # Check if a background task is running
         with web_session._lock:
@@ -275,8 +300,8 @@ class PptAgentWebService:
         if task_alive:
             web_session.emit("(Previous task still running in background...)")
             return {
-                "messages": web_session.events[before:],
-                "loop_state": shell.last_loop_state.__dict__ if shell.last_loop_state else {},
+                "messages": list(web_session.events)[before:],
+                "loop_state": _safe_loop_state(shell.last_loop_state),
                 "state": self.state(session_id),
             }
 
@@ -330,8 +355,8 @@ class PptAgentWebService:
                     _execute_skill_call(skill_call, session=shell, registry=registry, output_fn=web_session.emit)
 
         return {
-            "messages": web_session.events[before:],
-            "loop_state": shell.last_loop_state.__dict__,
+            "messages": list(web_session.events)[before:],
+            "loop_state": _safe_loop_state(shell.last_loop_state),
             "state": self.state(session_id),
         }
 
@@ -385,7 +410,8 @@ class PptAgentWebService:
                         web_session.last_error = result.get("reply") or "Build failed"
                 else:
                     # Only clear pending_action on success
-                    shell.pending_action = None
+                    with web_session._lock:
+                        shell.pending_action = None
             except Exception as exc:
                 logger.error("Background build failed: %s", exc, exc_info=True)
                 web_session.emit(f"Error: Build failed - {exc}")
@@ -722,7 +748,7 @@ class PptAgentWebService:
         if not evidence_path:
             evidence_dir = shell.workspace_dir / ".ppt-agent" / "data" / "evidence"
             if evidence_dir.exists():
-                candidates = sorted(evidence_dir.rglob("evidence.json"), reverse=True)
+                candidates = sorted(evidence_dir.rglob("evidence.json"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if candidates:
                     evidence_path = str(candidates[0])
         if not evidence_path:
@@ -787,31 +813,31 @@ class PptAgentWebService:
         evidence_json, evidence_dir = self._resolve_evidence_path(session_id)
         if not evidence_json or not evidence_json.exists():
             return {"ok": False, "error": "No evidence pack found"}
-        with open(evidence_json, "r", encoding="utf-8") as f:
-            pack_data = json.load(f)
-        figures = pack_data.get("figures", [])
-        new_figures = []
-        deleted = False
-        for fig in figures:
-            if fig.get("id") == figure_id:
-                # Delete image file (with path safety check)
-                raw_path = fig.get("path", "")
-                if raw_path:
-                    safe = self._safe_resolve(evidence_dir, raw_path)
-                    if safe and safe.exists() and safe.is_file():
-                        safe.unlink()
-                deleted = True
-            else:
-                new_figures.append(fig)
-        if not deleted:
-            return {"ok": False, "error": f"Figure {figure_id} not found"}
-        pack_data["figures"] = new_figures
-        with open(evidence_json, "w", encoding="utf-8") as f:
-            json.dump(pack_data, f, ensure_ascii=False, indent=2)
-        # Remove from selection
-        shell = self.sessions.get(session_id).shell
-        if figure_id in shell.selected_figure_ids:
-            shell.selected_figure_ids.remove(figure_id)
+        web_session = self.sessions.get(session_id)
+        shell = web_session.shell
+        with web_session._lock:
+            with open(evidence_json, "r", encoding="utf-8") as f:
+                pack_data = json.load(f)
+            figures = pack_data.get("figures", [])
+            new_figures = []
+            deleted = False
+            for fig in figures:
+                if fig.get("id") == figure_id:
+                    raw_path = fig.get("path", "")
+                    if raw_path:
+                        safe = self._safe_resolve(evidence_dir, raw_path)
+                        if safe and safe.exists() and safe.is_file():
+                            safe.unlink()
+                    deleted = True
+                else:
+                    new_figures.append(fig)
+            if not deleted:
+                return {"ok": False, "error": f"Figure {figure_id} not found"}
+            pack_data["figures"] = new_figures
+            with open(evidence_json, "w", encoding="utf-8") as f:
+                json.dump(pack_data, f, ensure_ascii=False, indent=2)
+            if figure_id in shell.selected_figure_ids:
+                shell.selected_figure_ids.remove(figure_id)
         return {"ok": True, "deleted": figure_id}
 
     def delete_evidence_source(self, session_id: str, source_file: str) -> dict[str, Any]:
@@ -819,43 +845,42 @@ class PptAgentWebService:
         evidence_json, evidence_dir = self._resolve_evidence_path(session_id)
         if not evidence_json or not evidence_json.exists():
             return {"ok": False, "error": "No evidence pack found"}
-        with open(evidence_json, "r", encoding="utf-8") as f:
-            pack_data = json.load(f)
-        shell = self.sessions.get(session_id).shell
-        deleted_ids = []
-        # Filter out figures from this source
-        new_figures = []
-        for fig in pack_data.get("figures", []):
-            if fig.get("source_file") == source_file:
-                raw_path = fig.get("path", "")
-                if raw_path:
-                    safe = self._safe_resolve(evidence_dir, raw_path)
-                    if safe and safe.exists() and safe.is_file():
-                        safe.unlink()
-                deleted_ids.append(fig.get("id"))
-                if fig.get("id") in shell.selected_figure_ids:
-                    shell.selected_figure_ids.remove(fig.get("id"))
-            else:
-                new_figures.append(fig)
-        # Filter out tables from this source
-        new_tables = []
-        for tbl in pack_data.get("tables", []):
-            if tbl.get("source_file") == source_file:
-                raw_path = tbl.get("path", "")
-                if raw_path:
-                    safe = self._safe_resolve(evidence_dir, raw_path)
-                    if safe and safe.exists() and safe.is_file():
-                        safe.unlink()
-                deleted_ids.append(tbl.get("id"))
-            else:
-                new_tables.append(tbl)
-        # Filter out sections from this source
-        new_sections = [s for s in pack_data.get("sections", []) if s.get("source_file") != source_file]
-        pack_data["figures"] = new_figures
-        pack_data["tables"] = new_tables
-        pack_data["sections"] = new_sections
-        with open(evidence_json, "w", encoding="utf-8") as f:
-            json.dump(pack_data, f, ensure_ascii=False, indent=2)
+        web_session = self.sessions.get(session_id)
+        shell = web_session.shell
+        with web_session._lock:
+            with open(evidence_json, "r", encoding="utf-8") as f:
+                pack_data = json.load(f)
+            deleted_ids = []
+            new_figures = []
+            for fig in pack_data.get("figures", []):
+                if fig.get("source_file") == source_file:
+                    raw_path = fig.get("path", "")
+                    if raw_path:
+                        safe = self._safe_resolve(evidence_dir, raw_path)
+                        if safe and safe.exists() and safe.is_file():
+                            safe.unlink()
+                    deleted_ids.append(fig.get("id"))
+                    if fig.get("id") in shell.selected_figure_ids:
+                        shell.selected_figure_ids.remove(fig.get("id"))
+                else:
+                    new_figures.append(fig)
+            new_tables = []
+            for tbl in pack_data.get("tables", []):
+                if tbl.get("source_file") == source_file:
+                    raw_path = tbl.get("path", "")
+                    if raw_path:
+                        safe = self._safe_resolve(evidence_dir, raw_path)
+                        if safe and safe.exists() and safe.is_file():
+                            safe.unlink()
+                    deleted_ids.append(tbl.get("id"))
+                else:
+                    new_tables.append(tbl)
+            new_sections = [s for s in pack_data.get("sections", []) if s.get("source_file") != source_file]
+            pack_data["figures"] = new_figures
+            pack_data["tables"] = new_tables
+            pack_data["sections"] = new_sections
+            with open(evidence_json, "w", encoding="utf-8") as f:
+                json.dump(pack_data, f, ensure_ascii=False, indent=2)
         return {"ok": True, "deleted_ids": deleted_ids, "source_file": source_file}
 
 
@@ -931,3 +956,14 @@ def _agent_skill_assignments_payload(shell: ShellSession) -> dict[str, list[dict
             if skill.name in active_names
         ]
     return payload
+
+
+def _safe_loop_state(loop_state: Any) -> dict[str, Any]:
+    """Return only safe fields from loop_state, avoiding __dict__ exposure."""
+    if loop_state is None:
+        return {}
+    return {
+        "terminal_reason": getattr(loop_state, "terminal_reason", None),
+        "pending_action": getattr(loop_state, "pending_action", None),
+        "draft_request": getattr(loop_state, "draft_request", None),
+    }

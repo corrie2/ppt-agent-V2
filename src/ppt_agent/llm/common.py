@@ -73,6 +73,8 @@ def llm_call_with_retry(
             if attempt > 0:
                 delay = min(2 ** attempt, 15)
                 logger.info("%s retry %d/%d after %ds", label, attempt, max_retries, delay)
+                # NOTE: time.sleep blocks the thread; acceptable for sync CLI tool,
+                # but would need asyncio.sleep for async/web workloads.
                 time.sleep(delay)
 
             logger.info("%s attempt %d/%d (timeout=%ds)", label, attempt + 1, max_retries + 1, timeout)

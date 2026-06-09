@@ -64,7 +64,13 @@ def _resolve_layout(slide_spec: SlideSpec) -> str:
     if slide_spec.layout_hint:
         return slide_spec.layout_hint
     if slide_spec.content.figure_ids:
-        return "figure_walkthrough"
+        # Smart choice: if slide also has bullets, prefer two_column_text_image
+        has_bullets = bool(slide_spec.content.bullets or slide_spec.bullets)
+        if has_bullets:
+            return "two_column_text_image"
+        return "figure_with_caption"
+    if slide_spec.content.table_ids:
+        return "result_cards"
     mapping = {
         "hero_image": "title_cover",
         "market_scene": "hero_image_plus_argument",
@@ -91,9 +97,14 @@ def _render_layout(
     tables_by_id: dict[str, TableAsset] | None = None,
     evidence_path: Path | None = None,
 ) -> None:
-    figure_layouts = {"figure_walkthrough", "figure_with_caption", "figure_caption", "two_column_figure", "method_figure_callouts"}
+    figure_layouts = {"figure_walkthrough", "figure_with_caption", "figure_caption", "two_column_figure", "method_figure_callouts", "two_column_text_image"}
     if slide_spec.content.figure_ids and layout not in figure_layouts:
-        layout = "figure_walkthrough"
+        # Only override to figure_walkthrough if the current layout truly can't handle figures
+        has_bullets = bool(slide_spec.content.bullets or slide_spec.bullets)
+        if has_bullets:
+            layout = "two_column_text_image"
+        else:
+            layout = "figure_with_caption"
     # Tables only get their own layout if no figure_ids are present (figures take priority).
     # When both figure_ids and table_ids exist, figures win; table data remains in slide_spec
     # for source footnotes and speaker notes but is not rendered as a dedicated table layout.
@@ -126,7 +137,11 @@ def _render_layout(
     if renderer is None:
         _render_two_column_text_image(slide, slide_spec, style)
         return
-    if layout in {"figure_walkthrough", "figure_with_caption", "figure_caption", "two_column_figure", "method_figure_callouts"}:
+    figure_capable_layouts = {"figure_walkthrough", "figure_with_caption", "figure_caption", "two_column_figure", "method_figure_callouts"}
+    if layout in figure_capable_layouts:
+        renderer(slide, slide_spec, style, figures_by_id=figures_by_id or {}, evidence_path=evidence_path)
+    elif layout == "two_column_text_image":
+        # Two-column layout can optionally use figures
         renderer(slide, slide_spec, style, figures_by_id=figures_by_id or {}, evidence_path=evidence_path)
     elif layout in {"result_cards", "result_table_summary"}:
         renderer(slide, slide_spec, style, tables_by_id=tables_by_id or {}, evidence_path=evidence_path)
@@ -180,11 +195,24 @@ def _render_hero_image_plus_argument(slide, slide_spec: SlideSpec, style: StyleP
     _render_visual_area(slide, slide_spec, style, Inches(6.0), Inches(1.3), Inches(6.1), Inches(4.9), accent=style.secondary)
 
 
-def _render_two_column_text_image(slide, slide_spec: SlideSpec, style: StylePreset) -> None:
+def _render_two_column_text_image(slide, slide_spec: SlideSpec, style: StylePreset, *, figures_by_id: dict | None = None, evidence_path: Path | None = None) -> None:
     _add_section_title(slide, slide_spec.title, style)
     _add_textbox(slide, Inches(0.8), Inches(1.4), Inches(5.1), Inches(0.7), _slide_message(slide_spec), 17, True, style.secondary, font_name=style.font_name)
     _add_textbox(slide, Inches(0.8), Inches(2.1), Inches(5.0), Inches(2.8), _join_lines(_visible_bullets(slide_spec)), 15, False, style.text_body, font_name=style.font_name)
-    _render_visual_area(slide, slide_spec, style, Inches(6.2), Inches(1.4), Inches(5.8), Inches(4.8), accent=style.tertiary)
+    # If slide has figure_ids and we have the evidence, try to render the figure directly
+    figure_rendered = False
+    if figures_by_id and slide_spec.content.figure_ids:
+        figure_id = slide_spec.content.figure_ids[0]
+        figure = figures_by_id.get(figure_id)
+        if figure and figure.path:
+            image_path = _resolve_evidence_asset_path(figure.path, evidence_path=evidence_path)
+            if image_path and image_path.exists():
+                _add_picture_contain(slide, image_path, Inches(6.2), Inches(1.4), Inches(5.8), Inches(4.8))
+                figure_rendered = True
+                caption = _figure_caption(figure, slide_spec, figure_id=figure_id)
+                _add_textbox(slide, Inches(6.2), Inches(6.3), Inches(5.8), Inches(0.4), caption, 9, False, style.text_muted, font_name=style.font_name)
+    if not figure_rendered:
+        _render_visual_area(slide, slide_spec, style, Inches(6.2), Inches(1.4), Inches(5.8), Inches(4.8), accent=style.tertiary)
 
 
 def _render_three_card_summary(slide, slide_spec: SlideSpec, style: StylePreset) -> None:

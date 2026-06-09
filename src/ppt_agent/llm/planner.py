@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 import httpx
 from pydantic import BaseModel
@@ -72,9 +73,15 @@ CRITICAL RULES:
    - Architecture/method figures MUST be used
    - Key result figures MUST be used
    - Each important figure gets its own slide
-3. CONTENT DENSITY: Each slide needs 3-5 bullets with SPECIFIC data.
-   - BAD: "The method performs well on benchmarks"
-   - GOOD: "JAG achieves QPS > 10,000 at recall 0.8 on MSTuring-10M (10x better than baselines)"
+3. BULLET QUALITY (MANDATORY):
+   - Every slide MUST have 3-5 bullets
+   - Each bullet MUST contain specific numbers, metrics, or concrete comparisons from the paper
+   - NEVER use vague language like "performs well", "good results", "significant improvement", "outperforms baselines"
+   - If you cannot find specific data in evidence, use the paper's actual reported numbers
+   - GOOD example: "JAG achieves QPS > 10,000 at recall 0.8 on MSTuring-10M (10x better than baselines)"
+   - BAD example: "The method performs well on benchmarks and achieves good results"
+   - GOOD example: "BLEU score improves from 32.1 to 38.7 (+6.6) on WMT'14 EN-DE"
+   - BAD example: "Significant improvement over previous approaches"
 4. ACADEMIC STRUCTURE: Follow paper structure (Problem -> Method -> Results -> Conclusion)
 5. Every slide must teach ONE specific idea from the paper.
 6. Do not use generic placeholders like 'Context and objective' or 'Primary recommendation'.
@@ -170,8 +177,9 @@ def _build_user_parts(intent: DeckIntent) -> list[str]:
         "",
         "- If paper_analysis is present, prioritize its problem, core_idea, method, experiments, limitations.",
         "- Every slide must have: role, message, layout, objective, core_message.",
-        "- Every slide must have 3-5 bullets with SPECIFIC data points (numbers, metrics, comparisons).",
-        "- Bullets must be concrete and grounded in evidence. Cite specific results.",
+        "- BULLETS MUST be 3-5 per slide, each with specific numbers/metrics/comparisons from the paper.",
+        "- NEVER use vague bullets like 'performs well', 'good results', 'significant improvement'.",
+        "- If you cannot find specific data, use the paper's actual reported numbers, not vague statements.",
         "- Each non-cover slide must include citations, evidence_refs, grounding_status.",
         "- If a slide uses a figure, put the figure evidence_id in content.figure_ids.",
         "- For result slides, prefer table_ids, metrics, or content.result_summary.",
@@ -188,12 +196,35 @@ def test_llm_connection(provider: str, *, model: str, api_key: str, timeout: flo
         raise PlannerConfigError(f"missing API key for provider {provider}")
 
     provider_spec = PROVIDER_SPECS[provider]
-    httpx.post(
-        f"{provider_spec.base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": model, "temperature": 0, "max_tokens": 8,
-              "messages": [{"role": "system", "content": "Reply with OK."},
-                           {"role": "user", "content": "Connection test."}]},
-        timeout=timeout,
-    ).raise_for_status()
-    return LlmConnectionResult(provider=provider, model=model, key_status="present", connection_ok=True)
+    url = f"{provider_spec.base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model, "temperature": 0, "max_tokens": 8,
+        "messages": [{"role": "system", "content": "Reply with OK."},
+                     {"role": "user", "content": "Connection test."}],
+    }
+
+    max_retries = 2
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            if attempt > 0:
+                delay = min(2 ** attempt, 10)
+                logger.info("test_llm_connection retry %d/%d after %ds", attempt, max_retries, delay)
+                time.sleep(delay)
+            response = httpx.post(url, headers=headers, json=body, timeout=timeout)
+            response.raise_for_status()
+            return LlmConnectionResult(provider=provider, model=model, key_status="present", connection_ok=True)
+        except httpx.TimeoutException as exc:
+            last_error = exc
+            logger.warning("test_llm_connection timed out (attempt %d/%d)", attempt + 1, max_retries + 1)
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            logger.warning("test_llm_connection HTTP %d (attempt %d/%d)", exc.response.status_code, attempt + 1, max_retries + 1)
+            if exc.response.status_code < 500 and exc.response.status_code != 429:
+                break  # Don't retry client errors (except rate limit)
+        except httpx.HTTPError as exc:
+            last_error = exc
+            logger.warning("test_llm_connection network error (attempt %d/%d): %s", attempt + 1, max_retries + 1, type(exc).__name__)
+
+    return LlmConnectionResult(provider=provider, model=model, key_status="error", connection_ok=False)

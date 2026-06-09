@@ -59,32 +59,39 @@ class SlideContent(BaseModel):
     @classmethod
     def coerce_list_fields(cls, data: Any) -> Any:
         """Normalize fields that expect lists: None→[], dict→[dict], string metrics→[dict]."""
+        _LIST_FIELDS = ("bullets", "figure_ids", "table_ids", "metrics",
+                        "callouts", "result_summary")
         if isinstance(data, dict):
-            # result_summary: None→[], dict→[dict]
+            # Generic: coerce None→[] for all list fields
+            for fld in _LIST_FIELDS:
+                if data.get(fld) is None:
+                    data[fld] = [] if fld != "metrics" else []
+
+            # result_summary: dict→[dict]
             rs = data.get("result_summary")
-            if rs is None:
-                data["result_summary"] = []
-            elif isinstance(rs, dict):
+            if isinstance(rs, dict):
                 data["result_summary"] = [rs]
 
-            # callouts: None→[], dict→[dict]
+            # callouts: dict→[dict]
             co = data.get("callouts")
-            if co is None:
-                data["callouts"] = []
-            elif isinstance(co, dict):
+            if isinstance(co, dict):
                 data["callouts"] = [co]
 
-            # metrics: None→[], string→[{"finding": str}], string items→[{"finding": str}]
+            # metrics: string→[{...}], string items→[{...}]
             mt = data.get("metrics")
-            if mt is None:
-                data["metrics"] = []
-            elif isinstance(mt, str):
+            if isinstance(mt, str):
                 data["metrics"] = [{"finding": mt}]
             elif isinstance(mt, list):
                 data["metrics"] = [
                     {"finding": m} if isinstance(m, str) else m
                     for m in mt
                 ]
+
+            # figure_ids / table_ids: coerce string→[string]
+            for id_field in ("figure_ids", "table_ids"):
+                val = data.get(id_field)
+                if isinstance(val, str):
+                    data[id_field] = [val]
         return data
 
 
@@ -120,6 +127,37 @@ class SlideSpec(BaseModel):
     grounding_status: str = "ungrounded"
     source_notes: str = ""
     quality_checks: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_llm_output(cls, data: Any) -> Any:
+        """Handle common LLM quirks before field validation."""
+        if not isinstance(data, dict):
+            return data
+        # Coerce None→[] for all list fields
+        _LIST_FIELDS = (
+            "bullets", "supporting_points", "style_tags",
+            "evidence_refs", "quality_checks", "citations",
+        )
+        for fld in _LIST_FIELDS:
+            if data.get(fld) is None:
+                data[fld] = []
+        # Coerce string bullets/supporting_points to list
+        for fld in ("bullets", "supporting_points"):
+            val = data.get(fld)
+            if isinstance(val, str):
+                data[fld] = [val]
+        # Coerce None string fields to ""
+        _STR_FIELDS = (
+            "role", "message", "layout", "objective", "core_message",
+            "speaker_notes", "visual_type", "image_query", "image_prompt",
+            "image_caption", "image_rationale", "layout_hint",
+            "grounding_status", "source_notes",
+        )
+        for fld in _STR_FIELDS:
+            if data.get(fld) is None:
+                data[fld] = ""
+        return data
 
     @model_validator(mode="after")
     def sync_new_and_legacy_fields(self) -> "SlideSpec":
@@ -202,6 +240,54 @@ class PptSpec(BaseModel):
     skill_root: str | None = None
     skill_md_path: str | None = None
     grounding_warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_llm_output(cls, data: Any) -> Any:
+        """Handle common LLM output quirks before field validation."""
+        if not isinstance(data, dict):
+            return data
+
+        # Ensure slides is a list; default to [] if missing or wrong type
+        slides = data.get("slides")
+        if slides is None:
+            data["slides"] = []
+        elif isinstance(slides, dict):
+            # LLM might wrap slides in a key like {"slides": {"slides": [...]}}
+            if "slides" in slides and isinstance(slides["slides"], list):
+                data["slides"] = slides["slides"]
+            else:
+                data["slides"] = [slides]
+        elif not isinstance(slides, list):
+            data["slides"] = []
+
+        # Filter out invalid slide entries (non-dict, empty, or missing title)
+        filtered = []
+        for slide in data["slides"]:
+            if isinstance(slide, dict):
+                # Ensure title exists — use message or core_message as fallback
+                if "title" not in slide or not slide["title"]:
+                    slide["title"] = slide.get("message") or slide.get("core_message") or "Untitled Slide"
+                filtered.append(slide)
+        data["slides"] = filtered
+
+        # Ensure title exists at top level
+        if "title" not in data or not data["title"]:
+            # Try to derive from first slide
+            if data["slides"]:
+                data["title"] = data["slides"][0].get("title", "Untitled Deck")
+            else:
+                data["title"] = "Untitled Deck"
+
+        # Coerce schema_version to int
+        sv = data.get("schema_version")
+        if sv is not None and not isinstance(sv, int):
+            try:
+                data["schema_version"] = int(sv)
+            except (ValueError, TypeError):
+                data["schema_version"] = 2
+
+        return data
 
 
 class Artifact(BaseModel):

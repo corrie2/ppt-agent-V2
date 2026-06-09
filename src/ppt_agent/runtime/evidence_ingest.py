@@ -130,31 +130,49 @@ def attach_evidence_figures_to_spec(
     valid_figure_ids = {f.id for f in pack.figures}
     valid_table_ids = {t.id for t in pack.tables}
 
+    # Build fuzzy lookup: normalized_id -> actual_id (strip leading zeros, lowercase)
+    _fuzzy_figure_map = _build_fuzzy_id_map(valid_figure_ids)
+    _fuzzy_table_map = _build_fuzzy_id_map(valid_table_ids)
+
     # ---- FIGURES ----
     # Priority: user selection > LLM assignment > auto-select
     if selected_figure_ids:
         # User selected figures — always use these, overwrite LLM's assignments
-        figures = [f for f in pack.figures if f.id in selected_figure_ids]
+        resolved_ids = [_resolve_fuzzy_id(fid, _fuzzy_figure_map) or fid for fid in selected_figure_ids]
+        figures = [f for f in pack.figures if f.id in resolved_ids]
+        unmatched = [fid for fid, rid in zip(selected_figure_ids, resolved_ids) if rid not in valid_figure_ids]
+        if unmatched:
+            logger.warning("User-selected figure_ids not found in evidence pack: %s", unmatched)
         logger.info("Using %d user-selected figures: %s", len(figures), [f.id for f in figures])
     elif any(slide.content.figure_ids for slide in spec.slides):
-        # LLM already assigned figures, user didn't select — validate and filter
+        # LLM already assigned figures, user didn't select — validate with fuzzy matching
         assigned_ids = {
             fid for slide in spec.slides for fid in slide.content.figure_ids
         }
-        invalid_ids = assigned_ids - valid_figure_ids
-        if invalid_ids:
-            logger.warning("Removing invalid LLM-assigned figure_ids not in evidence pack: %s", invalid_ids)
-            # Filter out invalid IDs from slide content
-            slides = list(spec.slides)
-            for slide in slides:
-                original = slide.content.figure_ids
-                filtered = [fid for fid in original if fid in valid_figure_ids]
-                if filtered != original:
-                    slide.content.figure_ids = filtered
-            spec = spec.model_copy(update={"slides": slides})
-        remaining = assigned_ids & valid_figure_ids
+        # Try fuzzy matching for each assigned ID
+        id_remap: dict[str, str] = {}  # original_id -> resolved_id
+        for fid in assigned_ids:
+            if fid in valid_figure_ids:
+                id_remap[fid] = fid
+            else:
+                resolved = _resolve_fuzzy_id(fid, _fuzzy_figure_map)
+                if resolved:
+                    id_remap[fid] = resolved
+                    logger.info("Fuzzy matched LLM figure_id '%s' -> '%s'", fid, resolved)
+        truly_invalid_ids = {fid for fid in assigned_ids if fid not in id_remap}
+        if truly_invalid_ids:
+            logger.warning("Removing unmatched LLM-assigned figure_ids not in evidence pack: %s", truly_invalid_ids)
+        # Remap IDs in slide content
+        slides = list(spec.slides)
+        for slide in slides:
+            original = slide.content.figure_ids
+            remapped = [id_remap[fid] for fid in original if fid in id_remap]
+            if remapped != original:
+                slide.content.figure_ids = remapped
+        spec = spec.model_copy(update={"slides": slides})
+        remaining = {id_remap[fid] for fid in assigned_ids if fid in id_remap}
         if remaining:
-            logger.info("Keeping validated LLM-assigned figures: %s", remaining)
+            logger.info("Keeping validated LLM-assigned figures (after fuzzy match): %s", remaining)
             figures = []
         else:
             # All LLM-assigned figures were invalid — fall through to auto-select
@@ -171,7 +189,7 @@ def attach_evidence_figures_to_spec(
 
     if figures:
         slides = list(spec.slides)
-        candidate_indexes = _figure_slide_indexes(len(slides), len(figures))
+        candidate_indexes = _figure_slide_indexes(len(slides), len(figures), slides=slides)
         for figure, slide_index in zip(figures, candidate_indexes):
             slide = slides[slide_index]
             slide.content.figure_ids = [figure.id]
@@ -192,26 +210,39 @@ def attach_evidence_figures_to_spec(
         return spec
 
     if selected_table_ids:
-        tables = [t for t in pack.tables if t.id in selected_table_ids]
+        resolved_table_ids = [_resolve_fuzzy_id(tid, _fuzzy_table_map) or tid for tid in selected_table_ids]
+        tables = [t for t in pack.tables if t.id in resolved_table_ids]
+        unmatched = [tid for tid, rid in zip(selected_table_ids, resolved_table_ids) if rid not in valid_table_ids]
+        if unmatched:
+            logger.warning("User-selected table_ids not found in evidence pack: %s", unmatched)
         logger.info("Using %d user-selected tables: %s", len(tables), [t.id for t in tables])
     elif any(slide.content.table_ids for slide in spec.slides):
-        # LLM assigned table_ids — validate and filter
+        # LLM assigned table_ids — validate with fuzzy matching
         assigned_ids = {
             tid for slide in spec.slides for tid in slide.content.table_ids
         }
-        invalid_ids = assigned_ids - valid_table_ids
-        if invalid_ids:
-            logger.warning("Removing invalid LLM-assigned table_ids not in evidence pack: %s", invalid_ids)
-            slides = list(spec.slides)
-            for slide in slides:
-                original = slide.content.table_ids
-                filtered = [tid for tid in original if tid in valid_table_ids]
-                if filtered != original:
-                    slide.content.table_ids = filtered
-            spec = spec.model_copy(update={"slides": slides})
-        remaining = assigned_ids & valid_table_ids
+        id_remap: dict[str, str] = {}
+        for tid in assigned_ids:
+            if tid in valid_table_ids:
+                id_remap[tid] = tid
+            else:
+                resolved = _resolve_fuzzy_id(tid, _fuzzy_table_map)
+                if resolved:
+                    id_remap[tid] = resolved
+                    logger.info("Fuzzy matched LLM table_id '%s' -> '%s'", tid, resolved)
+        truly_invalid_ids = {tid for tid in assigned_ids if tid not in id_remap}
+        if truly_invalid_ids:
+            logger.warning("Removing unmatched LLM-assigned table_ids not in evidence pack: %s", truly_invalid_ids)
+        slides = list(spec.slides)
+        for slide in slides:
+            original = slide.content.table_ids
+            remapped = [id_remap[tid] for tid in original if tid in id_remap]
+            if remapped != original:
+                slide.content.table_ids = remapped
+        spec = spec.model_copy(update={"slides": slides})
+        remaining = {id_remap[tid] for tid in assigned_ids if tid in id_remap}
         if remaining:
-            logger.info("Keeping validated LLM-assigned tables: %s", remaining)
+            logger.info("Keeping validated LLM-assigned tables (after fuzzy match): %s", remaining)
         else:
             logger.warning("All LLM-assigned table_ids were invalid")
         return spec
@@ -240,23 +271,44 @@ def attach_evidence_figures_to_spec(
     return spec
 
 
-def _figure_slide_indexes(slide_count: int, figure_count: int) -> list[int]:
+def _figure_slide_indexes(slide_count: int, figure_count: int, slides: list | None = None) -> list[int]:
     if slide_count <= 0:
         return []
-    anchors = [max(1, slide_count // 3), max(1, slide_count // 2), max(1, (slide_count * 2) // 3), max(1, slide_count - 2)]
-    indexes: list[int] = []
-    for anchor in anchors:
-        index = min(slide_count - 1, anchor)
-        if index not in indexes:
-            indexes.append(index)
-        if len(indexes) >= figure_count:
-            break
-    while len(indexes) < figure_count:
-        candidate = min(slide_count - 1, len(indexes) + 1)
-        if candidate not in indexes:
-            indexes.append(candidate)
-        else:
-            break
+
+    # Score slides by visual-relevance: prefer slides that hint at images
+    image_visual_types = {
+        "figure_with_caption", "figure_walkthrough", "figure_caption",
+        "two_column_text_image", "two_column_figure", "method_figure_callouts",
+        "hero_image_plus_argument", "title_cover",
+    }
+    image_layout_hints = image_visual_types | {"image", "figure", "diagram", "chart", "photo"}
+
+    slide_scores: list[tuple[int, float]] = []
+    for i in range(slide_count):
+        score = 0.0
+        if slides and i < len(slides):
+            slide = slides[i]
+            vt = (getattr(slide, "visual_type", None) or "").lower()
+            lh = (getattr(slide, "layout_hint", None) or "").lower()
+            role = (getattr(slide, "role", None) or "").lower()
+            # Boost slides whose visual_type or layout_hint suggests images
+            if vt in image_visual_types:
+                score += 2.0
+            if any(kw in lh for kw in image_layout_hints):
+                score += 1.5
+            # Boost slides with roles that commonly use figures
+            if any(kw in role for kw in ("method", "result", "experiment", "architecture", "framework", "analysis")):
+                score += 1.0
+        # Position bonus: middle slides are natural figure targets
+        position_ratio = (i + 1) / slide_count
+        if 0.2 <= position_ratio <= 0.8:
+            score += 0.5
+        slide_scores.append((i, score))
+
+    # Sort by score descending, then by index for stability
+    slide_scores.sort(key=lambda x: (-x[1], x[0]))
+    indexes = [idx for idx, _ in slide_scores[:figure_count]]
+    indexes.sort()  # restore ordering
     return indexes
 
 
@@ -459,3 +511,32 @@ def _truncate(value: str, *, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "..."
+
+
+def _normalize_id(id_str: str) -> str:
+    """Normalize an ID for fuzzy matching: strip leading zeros from numeric parts, lowercase."""
+    import re
+    # Split into alpha and numeric segments
+    parts = re.split(r'(\d+)', id_str.lower())
+    # Strip leading zeros from numeric segments
+    normalized = []
+    for part in parts:
+        if part.isdigit():
+            normalized.append(str(int(part)))  # "001" -> "1"
+        else:
+            normalized.append(part)
+    return "".join(normalized)
+
+
+def _build_fuzzy_id_map(valid_ids: set[str]) -> dict[str, str]:
+    """Build a mapping from normalized_id -> actual_id for fuzzy matching."""
+    mapping: dict[str, str] = {}
+    for vid in valid_ids:
+        mapping[_normalize_id(vid)] = vid
+    return mapping
+
+
+def _resolve_fuzzy_id(id_str: str, fuzzy_map: dict[str, str]) -> str | None:
+    """Try to resolve an ID using fuzzy matching. Returns actual ID or None."""
+    normalized = _normalize_id(id_str)
+    return fuzzy_map.get(normalized)

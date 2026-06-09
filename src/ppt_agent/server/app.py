@@ -307,13 +307,15 @@ def _get_or_404(fn):
     except (ValueError, ValidationError) as exc:
         import logging
         logging.getLogger(__name__).warning("Validation error: %s", exc)
-        raise HTTPException(status_code=400, detail="Invalid request data.") from exc
+        detail = str(exc)[:200] if exc else "Invalid request data."
+        raise HTTPException(status_code=400, detail=detail) from exc
     except HTTPException:
         raise
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("Server error: %s", exc)
-        raise HTTPException(status_code=500, detail="Internal server error.") from exc
+        detail = str(exc)[:200] if exc else "Internal server error."
+        raise HTTPException(status_code=500, detail=detail) from exc
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

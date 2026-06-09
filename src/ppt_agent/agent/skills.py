@@ -247,6 +247,10 @@ def parse_pdf_skill(*, session: ShellSession, pdf_path: str) -> dict[str, Any]:
         pdf = session.workspace_dir / pdf_path
     pdf = pdf.resolve()
 
+    # Prevent path traversal outside workspace
+    if not pdf.is_relative_to(session.workspace_dir.resolve()):
+        return {"ok": False, "reply": "Path outside workspace"}
+
     if not pdf.exists():
         return {"ok": False, "reply": f"PDF not found: {pdf_path}"}
 
@@ -423,6 +427,13 @@ def generate_plan_skill(
             f"This likely indicates a pipeline error or incomplete execution."
         )
     spec = PptSpec.model_validate(result["spec"])
+    # Post-generation quality check
+    quality_warnings = _check_spec_quality(spec)
+    if quality_warnings:
+        import logging
+        logging.getLogger(__name__).warning("Plan quality warnings:\n%s", "\n".join(f"  - {w}" for w in quality_warnings))
+        for w in quality_warnings[:5]:  # Show first 5 warnings to user
+            emit_progress(f"Quality warning: {w}")
     evidence_pack_for_render = None
     if resolved_source_digest and resolved_source_digest.get("type") == "evidence_pack":
         evidence_pack_for_render, _, _ = load_evidence_pack(resolved_source_digest.get("path"))
@@ -914,3 +925,57 @@ def _evidence_from_plan(document, *, session: ShellSession):
         evidence_path = session.latest_evidence_path
     pack, path, warnings = load_evidence_pack(evidence_path)
     return pack, path, warnings
+
+
+# --- Post-generation quality checks ---
+
+_GENERIC_BULLET_PHRASES = [
+    "performs well",
+    "good results",
+    "significant improvement",
+    "outperforms baselines",
+    "better than",
+    "achieves good",
+    "shows improvement",
+    "demonstrates effectiveness",
+    "high quality",
+    "state of the art",
+    "state-of-the-art",
+    "competitive performance",
+    "promising results",
+    "encouraging results",
+    "effective approach",
+    "robust performance",
+]
+
+
+def _check_spec_quality(spec: PptSpec) -> list[str]:
+    """Validate slide content quality after generation. Returns list of warning messages."""
+    import re
+    warnings: list[str] = []
+    for i, slide in enumerate(spec.slides):
+        slide_num = i + 1
+        bullets = slide.content.bullets or slide.bullets or []
+
+        # Check bullet count
+        if len(bullets) < 2:
+            warnings.append(f"Slide {slide_num} '{slide.title[:40]}' has only {len(bullets)} bullet(s), expected 3-5")
+
+        # Check for generic/vague bullet phrases
+        for j, bullet in enumerate(bullets):
+            bullet_lower = bullet.lower()
+            for phrase in _GENERIC_BULLET_PHRASES:
+                if phrase in bullet_lower:
+                    warnings.append(
+                        f"Slide {slide_num} bullet {j+1} contains vague phrase '{phrase}': '{bullet[:60]}'"
+                    )
+                    break
+
+        # Check for very short bullets (likely low quality)
+        for j, bullet in enumerate(bullets):
+            if bullet and len(bullet.strip()) < 15:
+                warnings.append(
+                    f"Slide {slide_num} bullet {j+1} is suspiciously short ({len(bullet.strip())} chars): '{bullet}'"
+                )
+
+    return warnings
