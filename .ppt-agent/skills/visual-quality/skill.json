@@ -1,0 +1,9 @@
+{
+  "name": "visual-quality",
+  "description": "Visual quality evaluation for PPT presentations",
+  "version": "1.0.0",
+  "type": "markdown",
+  "agent_scope": [
+    "visual_quality_evaluator"
+  ]
+}

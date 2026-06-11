@@ -1,0 +1,9 @@
+{
+  "name": "renderer-engineering",
+  "description": "PPTX renderer capability assessment and extension planning",
+  "version": "1.0.0",
+  "type": "markdown",
+  "agent_scope": [
+    "renderer_engineer"
+  ]
+}

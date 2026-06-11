@@ -696,6 +696,7 @@ class PptAgentWebService:
         from fastapi import HTTPException
         shell = self.sessions.get(session_id).shell
         evidence_path = shell.latest_evidence_path
+        workspace_dir = shell.workspace_dir.resolve()
 
         # Fallback: search workspace for evidence.json
         if not evidence_path:
@@ -727,9 +728,10 @@ class PptAgentWebService:
                 fig_path = fig.get("path", "")
                 if fig_path:
                     if Path(fig_path).is_absolute():
-                        # Absolute path - must also validate it's within evidence_dir
+                        # Absolute path - validate it's within workspace (not just evidence_dir)
+                        # Images are stored in .ppt-agent/ingest/ but evidence.json is in .ppt-agent/data/evidence/
                         resolved = Path(fig_path).resolve()
-                        if resolved.exists() and resolved.is_file() and resolved.is_relative_to(evidence_dir.resolve()):
+                        if resolved.exists() and resolved.is_file() and resolved.is_relative_to(workspace_dir):
                             return resolved
                     else:
                         # Relative path - resolve relative to evidence_dir

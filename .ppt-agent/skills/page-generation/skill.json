@@ -1,0 +1,9 @@
+{
+  "name": "page-generation",
+  "description": "Deterministic PPTX page generation from slide IR",
+  "version": "1.0.0",
+  "type": "markdown",
+  "agent_scope": [
+    "page_generator"
+  ]
+}

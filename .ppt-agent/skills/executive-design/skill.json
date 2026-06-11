@@ -1,0 +1,10 @@
+{
+  "name": "executive-design",
+  "description": "汇报PPT设计规范",
+  "version": "1.0.0",
+  "type": "markdown",
+  "agent_scope": [
+    "design_chart",
+    "page_designer"
+  ]
+}

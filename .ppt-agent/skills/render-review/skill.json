@@ -1,0 +1,9 @@
+{
+  "name": "render-review",
+  "description": "PPTX rendering quality review and issue detection",
+  "version": "1.0.0",
+  "type": "markdown",
+  "agent_scope": [
+    "render_review"
+  ]
+}

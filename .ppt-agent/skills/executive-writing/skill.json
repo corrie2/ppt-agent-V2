@@ -1,0 +1,10 @@
+{
+  "name": "executive-writing",
+  "description": "面向高管汇报的slide写作规范",
+  "version": "1.0.0",
+  "type": "markdown",
+  "agent_scope": [
+    "content",
+    "brief_outline"
+  ]
+}

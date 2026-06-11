@@ -1,0 +1,9 @@
+{
+  "name": "executive-qa",
+  "description": "汇报PPT质量检查规范",
+  "version": "1.0.0",
+  "type": "markdown",
+  "agent_scope": [
+    "qa"
+  ]
+}
