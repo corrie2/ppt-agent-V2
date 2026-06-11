@@ -272,9 +272,9 @@ def _render_comparison_table(slide, slide_spec: SlideSpec, style: StylePreset) -
         _style_cell(cell, True, style.surface)
     points = _visible_bullets(slide_spec)
     rows_data = [
-        ("Seller workflow", points[0] if len(points) > 0 else "Manual prep", slide_spec.bullets[0] if slide_spec.bullets else "AI-guided prep"),
-        ("Manager visibility", points[1] if len(points) > 1 else "Lagging signals", slide_spec.bullets[1] if len(slide_spec.bullets) > 1 else "Weekly leading indicators"),
-        ("Business impact", points[2] if len(points) > 2 else "", _slide_message(slide_spec)),
+        ("Dimension 1", points[0] if len(points) > 0 else "Current state", slide_spec.bullets[0] if slide_spec.bullets else "Target state"),
+        ("Dimension 2", points[1] if len(points) > 1 else "Current state", slide_spec.bullets[1] if len(slide_spec.bullets) > 1 else "Target state"),
+        ("Dimension 3", points[2] if len(points) > 2 else "", _slide_message(slide_spec)),
     ]
     for row_idx, row in enumerate(rows_data, start=1):
         for col_idx, value in enumerate(row):

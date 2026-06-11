@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import hmac
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
 from ppt_agent.app.web_service import PptAgentWebService
@@ -72,6 +74,13 @@ def create_app() -> FastAPI:
     _api_key = os.environ.get("PPT_AGENT_API_KEY", "")
 
     app = FastAPI(title="PPT Agent Studio", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     service = PptAgentWebService()
     logger = logging.getLogger(__name__)
 
@@ -112,7 +121,7 @@ def create_app() -> FastAPI:
             bearer = ""
             if auth_header.lower().startswith("bearer "):
                 bearer = auth_header[7:]
-            if header_key != _api_key and bearer != _api_key:
+            if not hmac.compare_digest(header_key, _api_key) and not hmac.compare_digest(bearer, _api_key):
                 raise HTTPException(status_code=401, detail="Missing or invalid API key.")
             return await call_next(request)
         logging.getLogger(__name__).info("API key authentication ENABLED (PPT_AGENT_API_KEY is set)")

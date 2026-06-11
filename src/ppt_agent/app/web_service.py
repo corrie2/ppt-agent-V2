@@ -52,10 +52,11 @@ class WebSession:
 
     def add_to_history(self, role: str, content: str) -> None:
         """Add a message to conversation history, truncating if needed."""
-        self.conversation_history.append({"role": role, "content": content})
-        max_msgs = self.MAX_HISTORY_ROUNDS * 2
-        if len(self.conversation_history) > max_msgs:
-            self.conversation_history = self.conversation_history[-max_msgs:]
+        with self._lock:
+            self.conversation_history.append({"role": role, "content": content})
+            max_msgs = self.MAX_HISTORY_ROUNDS * 2
+            if len(self.conversation_history) > max_msgs:
+                self.conversation_history = self.conversation_history[-max_msgs:]
 
 
 class WebSessionStore:
@@ -325,9 +326,9 @@ class PptAgentWebService:
                         for skill_call in decision.skill_calls:
                             try:
                                 result = _execute_skill_call(skill_call, session=shell, registry=registry, output_fn=web_session.emit)
-                                if isinstance(result, dict) and result.get("ok") is False:
+                                if not isinstance(result, dict) or result.get("ok") is False:
                                     with web_session._lock:
-                                        web_session.last_error = result.get("reply") or f"{skill_call.name} failed"
+                                        web_session.last_error = (result.get("reply") if isinstance(result, dict) else None) or f"{skill_call.name} failed"
                             except Exception as exc:
                                 import logging
                                 logging.getLogger(__name__).error("Background skill %s failed: %s", skill_call.name, exc, exc_info=True)

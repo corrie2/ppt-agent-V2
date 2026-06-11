@@ -52,10 +52,12 @@ def load_selection(cwd: Path | None = None) -> LlmSelection | None:
 
 
 def save_api_key(provider: str, api_key: str, cwd: Path | None = None) -> Path:
+    import os
     validate_provider(provider)
     path = key_path(provider, cwd)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(api_key.strip(), encoding="utf-8")
+    os.chmod(path, 0o600)
     return path
 
 

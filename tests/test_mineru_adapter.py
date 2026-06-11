@@ -93,6 +93,8 @@ def test_mineru_adapter_raises_clear_error_when_command_missing(monkeypatch, tmp
 
     monkeypatch.setattr("shutil.which", lambda command: None)
 
+    monkeypatch.setattr("ppt_agent.ingest.mineru_adapter._get_pdf_page_count", lambda path: 1)
+
     with pytest.raises(RuntimeError, match="MinerU is not installed or not found in PATH"):
         MinerUAdapter().parse(source, tmp_path / "missing-output")
 
@@ -102,11 +104,13 @@ def test_mineru_adapter_can_invoke_mocked_command(monkeypatch, tmp_path):
     source.write_bytes(b"%PDF")
     output_dir = tmp_path / "mineru-output"
 
+    monkeypatch.setattr("ppt_agent.ingest.mineru_adapter._get_pdf_page_count", lambda path: 1)
+
     monkeypatch.setattr("shutil.which", lambda command: "mineru")
 
     commands = []
 
-    def fake_run(command, *, check, capture_output, text):
+    def fake_run(command, **kwargs):
         commands.append(command)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "paper.md").write_text("# Generated\nCreated by fake mineru.\n", encoding="utf-8")
@@ -130,9 +134,11 @@ def test_mineru_adapter_passes_cli_options_to_command(monkeypatch, tmp_path):
     output_dir = tmp_path / "mineru-output"
     commands = []
 
+    monkeypatch.setattr("ppt_agent.ingest.mineru_adapter._get_pdf_page_count", lambda path: 1)
+
     monkeypatch.setattr("shutil.which", lambda command: "mineru")
 
-    def fake_run(command, *, check, capture_output, text):
+    def fake_run(command, **kwargs):
         commands.append(command)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "paper.md").write_text("# Generated\nCreated by fake mineru.\n", encoding="utf-8")
@@ -171,10 +177,10 @@ def test_mineru_adapter_passes_cli_options_to_command(monkeypatch, tmp_path):
             "--end",
             "2",
             "--formula",
-            "False",
+            "false",
             "--table",
-            "True",
+            "true",
             "--image-analysis",
-            "False",
+            "false",
         ]
     ]

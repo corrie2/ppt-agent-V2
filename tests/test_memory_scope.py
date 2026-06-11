@@ -16,8 +16,10 @@ def test_resolve_project_scope_falls_back_for_non_git_directory(monkeypatch, tmp
     assert scope.git_remote is None
 
 
-def test_resolve_project_scope_uses_git_root_for_workspace_subdirectory(tmp_path):
+def test_resolve_project_scope_uses_git_root_for_workspace_subdirectory(monkeypatch, tmp_path):
     _require_git()
+    monkeypatch.setenv("PPT_AGENT_MEMORY_SCOPE_MODE", "git")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.resolve()))
     repo = tmp_path / "repo"
     nested = repo / "sub" / "dir"
     nested.mkdir(parents=True)
@@ -29,8 +31,10 @@ def test_resolve_project_scope_uses_git_root_for_workspace_subdirectory(tmp_path
     assert scope.name == repo.name
 
 
-def test_resolve_project_scope_reads_origin_remote(tmp_path):
+def test_resolve_project_scope_reads_origin_remote(monkeypatch, tmp_path):
     _require_git()
+    monkeypatch.setenv("PPT_AGENT_MEMORY_INCLUDE_GIT_REMOTE", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.resolve()))
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init")

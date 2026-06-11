@@ -245,18 +245,18 @@ def test_search_memory_records_by_embedding_validates_inputs():
     config = MemoryConfig(enabled=True, database_url="postgresql://example", embedding_model="model")
     project = MemoryProject(id="project-1", name="repo", root_path="E:/repo", git_remote=None)
 
-    with pytest.raises(ValueError, match="project.id must be non-empty"):
+    with pytest.raises(RuntimeError, match="project.id must be non-empty"):
         search_memory_records_by_embedding(
             MemoryProject(id="", name="repo", root_path="E:/repo", git_remote=None),
             query_embedding=[0.1] * 384,
             embedding_model="model",
             config=config,
         )
-    with pytest.raises(ValueError, match="query_embedding must be non-empty"):
+    with pytest.raises(RuntimeError, match="query_embedding must be non-empty"):
         search_memory_records_by_embedding(project, query_embedding=[], embedding_model="model", config=config)
-    with pytest.raises(ValueError, match="query_embedding must contain exactly 384 values"):
+    with pytest.raises(RuntimeError, match="query_embedding must contain exactly 384 values"):
         search_memory_records_by_embedding(project, query_embedding=[0.1], embedding_model="model", config=config)
-    with pytest.raises(ValueError, match="embedding_model must be non-empty"):
+    with pytest.raises(RuntimeError, match="embedding_model must be non-empty"):
         search_memory_records_by_embedding(project, query_embedding=[0.1] * 384, embedding_model="", config=config)
 
 
@@ -591,7 +591,7 @@ def test_create_memory_record_validates_input(record, message):
     config = MemoryConfig(enabled=True, database_url="postgresql://example", embedding_model="model")
     project = MemoryProject(id="project-1", name="repo", root_path="E:/repo", git_remote=None)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(RuntimeError, match=message):
         create_memory_record(project, record, config=config)
 
 
@@ -668,7 +668,7 @@ def test_get_memory_record_requires_project_id(monkeypatch):
 
     with pytest.raises(TypeError):
         get_memory_record("record-7", config=config)
-    with pytest.raises(ValueError, match="project_id must be non-empty"):
+    with pytest.raises(RuntimeError, match="project_id must be non-empty"):
         get_memory_record("record-7", project_id="", config=config)
 
 
@@ -862,13 +862,13 @@ def test_upsert_memory_embedding_validates_inputs():
 
     config = MemoryConfig(enabled=True, database_url="postgresql://example", embedding_model="model")
 
-    with pytest.raises(ValueError, match="record_id must be non-empty"):
+    with pytest.raises(RuntimeError, match="record_id must be non-empty"):
         upsert_memory_embedding("", embedding_model="model", embedding=[0.1] * 384, config=config)
-    with pytest.raises(ValueError, match="embedding_model must be non-empty"):
+    with pytest.raises(RuntimeError, match="embedding_model must be non-empty"):
         upsert_memory_embedding("record-1", embedding_model="", embedding=[0.1] * 384, config=config)
-    with pytest.raises(ValueError, match="embedding must be non-empty"):
+    with pytest.raises(RuntimeError, match="embedding must be non-empty"):
         upsert_memory_embedding("record-1", embedding_model="model", embedding=[], config=config)
-    with pytest.raises(ValueError, match="embedding must contain exactly 384 values"):
+    with pytest.raises(RuntimeError, match="embedding must contain exactly 384 values"):
         upsert_memory_embedding("record-1", embedding_model="model", embedding=[0.1, 0.2], config=config)
 
 
@@ -1136,5 +1136,5 @@ def test_get_memory_embedding_requires_project_id(monkeypatch):
 
     with pytest.raises(TypeError):
         get_memory_embedding("record-7", embedding_model="model-b", config=config)
-    with pytest.raises(ValueError, match="project_id must be non-empty"):
+    with pytest.raises(RuntimeError, match="project_id must be non-empty"):
         get_memory_embedding("record-7", embedding_model="model-b", project_id="", config=config)

@@ -74,7 +74,7 @@ def test_asset_resolve_failure_keeps_placeholder_and_warning(monkeypatch):
 def test_build_uses_real_picture_path(monkeypatch, tmp_path):
     seen: list[str] = []
 
-    def fake_add_picture(slide, image_path: str, left, top, width, height, *, caption: str = ""):
+    def fake_add_picture(slide, style, image_path: str, left, top, width, height, *, caption: str = ""):
         seen.append(image_path)
 
     monkeypatch.setattr("ppt_agent.runtime.pptx._add_picture", fake_add_picture)

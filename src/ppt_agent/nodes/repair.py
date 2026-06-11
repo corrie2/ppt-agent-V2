@@ -26,7 +26,7 @@ def repair_node(state: dict[str, Any]) -> dict[str, Any]:
 
     repaired_slides: list[SlideSpec] = []
     for index, slide in enumerate(spec.slides, start=1):
-        if not slide.title.strip():
+        if not slide.title.strip() or slide.title == "Untitled Slide":
             slide.title = f"Slide {index}"
         if not slide.bullets:
             slide.bullets = [

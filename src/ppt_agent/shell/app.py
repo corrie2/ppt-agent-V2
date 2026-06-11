@@ -192,11 +192,11 @@ def _explicit_disabled_user_skill(text: str, session: ShellSession) -> str | Non
     return None
 
 
-def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registry: SkillRegistry, output_fn) -> None:
+def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registry: SkillRegistry, output_fn) -> dict:
     # HIGH: Guard against unknown skill names (Issue 3)
     if skill_call.name not in registry.names():
         output_fn(f"Unknown skill: {skill_call.name}")
-        return
+        return {"ok": False, "reply": f"Unknown skill: {skill_call.name}"}
     skill_def = registry.get(skill_call.name)
 
     # HIGH: Only allow auto_approve for specific skills (Issue 2)
@@ -218,7 +218,7 @@ def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registr
             output_fn("Build is pending approval. Run /approve to continue.")
         else:
             output_fn(f"{skill_call.name} is pending approval. Run /approve to continue.")
-        return
+        return {"ok": True, "reply": "pending_approval"}
 
     # CRITICAL: Fill plan_path for build_ppt even in auto_approve path (Issue 1)
     if skill_call.name == "build_ppt" and not skill_call.arguments.get("plan_path"):
@@ -249,7 +249,7 @@ def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registr
         import logging
         logging.getLogger(__name__).error("Skill %s failed: %s", skill_call.name, exc, exc_info=True)
         output_fn(f"Error: {skill_call.name} failed - {exc}")
-        return
+        return {"ok": False, "reply": str(exc)}
 
     session.last_loop_state.last_skill_result = result
     reply = result.get("reply")
@@ -258,7 +258,7 @@ def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registr
     if result.get("skill_markdown"):
         output_fn(f"Skill instructions loaded for this turn: {result.get('skill_name', skill_call.name)}")
         _advance_draft_to_plan_if_possible(session, registry=registry, output_fn=output_fn, allow_default_topic=True)
-        return
+        return result
 
     if skill_call.name == "scan_workspace":
         if result.get("files"):
@@ -270,6 +270,7 @@ def _execute_skill_call(skill_call: SkillCall, *, session: ShellSession, registr
     if skill_call.name == "generate_plan":
         _qa_generated_plan(result, session=session, registry=registry, output_fn=output_fn)
         _set_pending_build_from_plan_result(result, session=session, output_fn=output_fn)
+    return result
 
 
 def _pending_skill_description(skill_name: str) -> str:

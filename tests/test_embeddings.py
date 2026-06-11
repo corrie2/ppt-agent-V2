@@ -46,7 +46,7 @@ def test_embed_texts_uses_cached_model(monkeypatch):
     from ppt_agent.storage import embeddings
 
     class FakeModel:
-        def encode(self, texts, normalize_embeddings):
+        def encode(self, texts, normalize_embeddings, show_progress_bar=False):
             assert texts == ["a", "b"]
             assert normalize_embeddings is True
             return [[1, 2], [3.5, 4]]

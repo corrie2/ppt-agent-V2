@@ -269,6 +269,8 @@ class PptSpec(BaseModel):
                 if "title" not in slide or not slide["title"]:
                     slide["title"] = slide.get("message") or slide.get("core_message") or "Untitled Slide"
                 filtered.append(slide)
+            elif hasattr(slide, 'title'):  # SlideSpec object
+                filtered.append(slide)
         data["slides"] = filtered
 
         # Ensure title exists at top level

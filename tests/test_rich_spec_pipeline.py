@@ -68,7 +68,7 @@ def test_rich_schema_can_be_written_read_and_validated(tmp_path):
 def test_build_routes_different_layouts(monkeypatch, tmp_path):
     seen_layouts: list[str] = []
 
-    def fake_render(slide, slide_spec, layout):
+    def fake_render(slide, slide_spec, layout, style, **kwargs):
         seen_layouts.append(layout)
 
     monkeypatch.setattr("ppt_agent.runtime.pptx._render_layout", fake_render)

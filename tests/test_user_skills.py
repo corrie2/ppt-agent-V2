@@ -349,11 +349,12 @@ def test_chat_agent_prompt_lists_only_enabled_user_skills(tmp_path):
     _write_json_skill(tmp_path, name="disabled-skill", description="Disabled summary.")
     session = ShellSession.create(tmp_path)
     session.enabled_user_skills = ["enabled-skill"]
+    session.disabled_user_skills = ["disabled-skill"]
     registry = SkillRegistry()
     register_default_skills(registry, session=session)
     reload_user_skills(registry, session=session)
 
-    prompt = ChatAgent()._system_prompt(registry, enabled_user_skills=session.enabled_user_skills)
+    prompt = ChatAgent()._system_prompt(registry, enabled_user_skills=session.enabled_user_skills, disabled_user_skills=session.disabled_user_skills)
 
     assert "Enabled summary." in prompt
     assert "Disabled summary." not in prompt

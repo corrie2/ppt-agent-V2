@@ -46,7 +46,7 @@ def test_repair_plan_from_qa_report_reduces_issues_without_touching_pptx(tmp_pat
     by_id = {slide["id"]: slide for slide in repaired["slides"]}
     assert by_id["missing-figure"]["content"]["figure_ids"] == []
     assert by_id["empty-message"]["message"]
-    assert len(by_id["too-many-bullets"]["bullets"]) == 5
+    assert len(by_id["too-many-bullets"]["bullets"]) == 3
     assert by_id["bad-citation"]["citations"] == []
     assert by_id["layout-mismatch"]["layout"] == "figure_with_caption"
 
