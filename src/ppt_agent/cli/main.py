@@ -1403,6 +1403,8 @@ def test_llm(
     console.print(f"Model: {result.model}")
     console.print(f"Key Status: {result.key_status}")
     console.print(f"Connection OK: {'yes' if result.connection_ok else 'no'}")
+    if not result.connection_ok:
+        raise typer.Exit(code=1)
 
 
 @app.command("serve")

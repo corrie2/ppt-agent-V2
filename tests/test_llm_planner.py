@@ -86,7 +86,7 @@ def test_plan_uses_saved_llm_configuration(monkeypatch):
         assert payload["title"] == "AI GTM Plan"
         assert payload["slides"][0]["title"] == "Context"
         assert "visual_type" in payload["slides"][0]
-        assert captured["url"] == "https://api.deepseek.com/chat/completions"
+        assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
         assert captured["json"]["model"] == "deepseek-chat"
         assert captured["headers"]["Authorization"] == "Bearer sk-deepseek"
 
@@ -147,7 +147,7 @@ def test_llm_test_uses_default_configuration(monkeypatch):
         assert "Model: deepseek-chat" in result.output
         assert "Key Status: present" in result.output
         assert "Connection OK: yes" in result.output
-        assert captured["url"] == "https://api.deepseek.com/chat/completions"
+        assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
         assert captured["json"]["model"] == "deepseek-chat"
 
 
@@ -186,7 +186,7 @@ def test_llm_test_api_failure_returns_nonzero(monkeypatch):
         result = runner.invoke(app, ["llm", "test"])
 
         assert result.exit_code == 1
-        assert "connection test failed" in result.output
+        assert "Connection OK: no" in result.output
 
 
 def test_llm_test_with_explicit_provider_and_model(monkeypatch):
